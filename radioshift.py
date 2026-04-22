@@ -133,16 +133,33 @@ def log(msg: str):
         pass
 
 
+MIN_CHUNK_BYTES = 1 * 1024 * 1024  # 1 MB — ignore stub files from interrupted starts
+
+
+def valid_chunks() -> list:
+    """Return chunks that contain meaningful audio, sorted oldest first."""
+    return [
+        f for f in sorted(CACHE_DIR().glob("chunk_*.mp3"))
+        if f.stat().st_size >= MIN_CHUNK_BYTES
+    ]
+
+
 def clean_old_chunks():
     cutoff = utcnow() - datetime.timedelta(hours=MAX_AGE_H())
+    current = chunk_path(utcnow())
     for f in sorted(CACHE_DIR().glob("chunk_*.mp3")):
         dt = parse_chunk_dt(f)
-        if dt and dt < cutoff:
-            try:
+        if not dt:
+            continue
+        try:
+            if dt < cutoff:
                 f.unlink()
-                log(f"Deleted {f.name}")
-            except OSError:
-                pass
+                log(f"Deleted old chunk: {f.name}")
+            elif f != current and f.stat().st_size < MIN_CHUNK_BYTES:
+                f.unlink()
+                log(f"Deleted stub chunk: {f.name}")
+        except OSError:
+            pass
 
 
 def read_pid() -> Optional[int]:
@@ -669,7 +686,7 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         target_chunk = chunk_path(target_dt)
 
         if not target_chunk.exists():
-            chunks = sorted(CACHE_DIR().glob("chunk_*.mp3"))
+            chunks = valid_chunks()
             first_dt = parse_chunk_dt(chunks[0]) if chunks else None
             if first_dt:
                 avail_at = first_dt + datetime.timedelta(hours=delay + 1)
@@ -787,9 +804,21 @@ def recording_loop():
         duration = max(1, int((next_hour - now).total_seconds()))
         out = chunk_path(now)
 
+        # Preserve chunks that already have real data (e.g. after a daemon restart)
+        if out.exists() and out.stat().st_size >= MIN_CHUNK_BYTES:
+            log(f"Chunk {out.name} already has data, waiting for next hour")
+            while utcnow() < next_hour:
+                time.sleep(5)
+            clean_old_chunks()
+            continue
+
+        # Remove stubs so ffmpeg doesn't fail on an existing file
+        if out.exists():
+            out.unlink()
+
         log(f"Recording {out.name} for {duration}s")
         _active_ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-y", "-i", STREAM_URL(), "-t", str(duration), "-c", "copy", str(out)],
+            ["ffmpeg", "-i", STREAM_URL(), "-t", str(duration), "-c", "copy", str(out)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
@@ -899,7 +928,7 @@ def cmd_status():
     else:
         print("Daemon:  not running")
 
-    chunks = sorted(CACHE_DIR().glob("chunk_*.mp3"))
+    chunks = valid_chunks()
     if chunks:
         mb = sum(c.stat().st_size for c in chunks) / 1024 / 1024
         a = parse_chunk_dt(chunks[0])
