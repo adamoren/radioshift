@@ -163,6 +163,106 @@ def is_running(pid: int) -> bool:
 # HTML generation
 # ---------------------------------------------------------------------------
 
+import json as _json
+
+def _js_routes() -> str:
+    """JSON map of slug → IANA name, for client-side timezone detection."""
+    return _json.dumps({label.lower(): iana for label, iana in tz_routes().items()})
+
+
+def html_autodetect() -> str:
+    """Tiny redirect page: detects browser timezone, bounces to the best slug."""
+    routes_json = _js_routes()
+    default = default_tz().lower()
+    return f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Redirecting...</title>
+<script>
+(function(){{
+  var routes = {routes_json};
+  var userTZ = (Intl && Intl.DateTimeFormat) ? Intl.DateTimeFormat().resolvedOptions().timeZone : '';
+
+  // 1. Exact IANA match
+  for (var slug in routes) {{
+    if (routes[slug] === userTZ) {{ location.replace('/' + slug); return; }}
+  }}
+
+  // 2. Closest UTC-offset match
+  function tzOffsetMin(iana) {{
+    try {{
+      var s = new Intl.DateTimeFormat('en', {{timeZone: iana, timeZoneName: 'shortOffset'}})
+                      .formatToParts(new Date())
+                      .find(function(p){{ return p.type === 'timeZoneName'; }});
+      var m = s && s.value.match(/GMT([+-])(\\d+)(?::(\\d+))?/);
+      if (!m) return 0;
+      return (m[1] === '-' ? 1 : -1) * (parseInt(m[2]) * 60 + parseInt(m[3] || 0));
+    }} catch(e) {{ return 0; }}
+  }}
+
+  var userOff = new Date().getTimezoneOffset();
+  var best = '{default}', bestDiff = Infinity;
+  for (var slug in routes) {{
+    var diff = Math.abs(userOff - tzOffsetMin(routes[slug]));
+    if (diff < bestDiff) {{ bestDiff = diff; best = slug; }}
+  }}
+  location.replace('/' + best);
+}})();
+</script>
+<noscript><meta http-equiv="refresh" content="0;url=/{default}"></noscript>
+</head><body></body></html>"""
+
+
+def _tz_suggest_js(current_slug: str) -> str:
+    """JS snippet: if browser timezone better matches a different slug, show a banner."""
+    routes_json = _js_routes()
+    accent = ACCENT()
+    return f"""<script>
+(function(){{
+  var routes = {routes_json};
+  var current = '{current_slug.lower()}';
+  var userTZ = (Intl && Intl.DateTimeFormat) ? Intl.DateTimeFormat().resolvedOptions().timeZone : '';
+  if (!userTZ) return;
+
+  function tzOffsetMin(iana) {{
+    try {{
+      var s = new Intl.DateTimeFormat('en', {{timeZone: iana, timeZoneName: 'shortOffset'}})
+                      .formatToParts(new Date())
+                      .find(function(p){{ return p.type === 'timeZoneName'; }});
+      var m = s && s.value.match(/GMT([+-])(\\d+)(?::(\\d+))?/);
+      if (!m) return 0;
+      return (m[1] === '-' ? 1 : -1) * (parseInt(m[2]) * 60 + parseInt(m[3] || 0));
+    }} catch(e) {{ return 0; }}
+  }}
+
+  var best = null;
+  // Exact match first
+  for (var slug in routes) {{ if (routes[slug] === userTZ) {{ best = slug; break; }} }}
+  // Offset match fallback
+  if (!best) {{
+    var userOff = new Date().getTimezoneOffset(), bestDiff = Infinity;
+    for (var slug in routes) {{
+      var diff = Math.abs(userOff - tzOffsetMin(routes[slug]));
+      if (diff < bestDiff) {{ bestDiff = diff; best = slug; }}
+    }}
+  }}
+
+  if (best && best !== current) {{
+    var b = document.createElement('div');
+    b.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+      'background:#222;border:1px solid #333;border-radius:12px;padding:12px 18px;' +
+      'font-size:13px;color:#ccc;white-space:nowrap;box-shadow:0 4px 20px rgba(0,0,0,.5);' +
+      'display:flex;align-items:center;gap:12px;z-index:999;';
+    b.innerHTML = 'Your timezone looks like <strong style="color:#fff">' + best.toUpperCase() + '</strong> &nbsp;' +
+      '<a href="/' + best + '" style="background:{accent};color:#fff;border-radius:7px;' +
+      'padding:5px 12px;text-decoration:none;font-weight:600;font-size:12px;">Switch</a>' +
+      '<span onclick="this.parentNode.remove()" style="cursor:pointer;color:#555;font-size:16px;line-height:1;">&times;</span>';
+    document.body.appendChild(b);
+  }}
+}})();
+</script>"""
+
+
 def _tz_tabs(active_tz: str) -> str:
     tabs = ""
     for label, iana in tz_routes().items():
@@ -314,6 +414,7 @@ def html_player(tz: str, iana: str, delay: float,
       {tabs}
     </div>
   </div>
+{_tz_suggest_js(tz)}
 </body>
 </html>"""
 
@@ -444,7 +545,8 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/":
-            path = f"/{default_tz().lower()}"
+            self._html(200, html_autodetect())
+            return
 
         slug = path.lstrip("/")
         iana = tz_routes().get(slug.upper())
