@@ -20,6 +20,7 @@ import argparse
 import threading
 import subprocess
 import datetime
+import urllib.request
 from pathlib import Path
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -269,6 +270,8 @@ def _tz_tabs(active_tz: str) -> str:
         slug = label.lower()
         active = ' class="active"' if slug == active_tz else ""
         tabs += f'<a href="/{slug}"{active}>{label}</a>\n            '
+    live_active = ' class="active live"' if active_tz == "live" else ' class="live"'
+    tabs += f'<a href="/live"{live_active}>&#9679; Live</a>\n            '
     return tabs
 
 
@@ -376,10 +379,10 @@ def html_player(tz: str, iana: str, delay: float,
       letter-spacing: .03em;
       transition: background .15s, color .15s;
     }}
-    .tz-tabs a.active, .tz-tabs a:hover {{
-      background: var(--accent);
-      color: #fff;
-    }}
+    .tz-tabs a.active {{ background: var(--accent); color: #fff; }}
+    .tz-tabs a:hover:not(.active) {{ background: #2a2a2a; color: #ccc; }}
+    .tz-tabs a.live {{ color: #cc2200; }}
+    .tz-tabs a.live.active, .tz-tabs a.live:hover {{ background: #cc2200; color: #fff; }}
   </style>
 </head>
 <body>
@@ -415,6 +418,102 @@ def html_player(tz: str, iana: str, delay: float,
     </div>
   </div>
 {_tz_suggest_js(tz)}
+</body>
+</html>"""
+
+
+def html_live() -> str:
+    s = station()
+    name        = s.get("name", "Radio")
+    name_local  = s.get("name_local", "")
+    desc        = s.get("description", "")
+    accent      = ACCENT()
+    tabs        = _tz_tabs("live")
+    display_name = name_local if name_local else name
+    now         = utcnow()
+    source_time = fmt_source(now)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{name} &mdash; Live</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    :root {{ --accent: {accent}; }}
+    body {{
+      background: #0d0d0d; color: #f0f0f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+    }}
+    .card {{
+      background: #181818; border-radius: 20px; padding: 40px 36px 32px;
+      width: min(420px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,.6);
+    }}
+    .header {{ display: flex; align-items: center; gap: 16px; margin-bottom: 28px; }}
+    .logo-wrap {{
+      width: 64px; height: 64px;
+      background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 60%, black), var(--accent));
+      border-radius: 16px; display: flex; align-items: center; justify-content: center;
+      font-size: 32px; flex-shrink: 0;
+    }}
+    .name {{ font-size: 26px; font-weight: 700; letter-spacing: -.5px; }}
+    .sub  {{ font-size: 13px; color: #777; margin-top: 2px; }}
+    .live-banner {{
+      background: #1a0a0a; border: 1px solid #3a1010; border-radius: 12px;
+      padding: 14px 18px; margin-bottom: 24px;
+      display: flex; align-items: center; gap: 12px;
+    }}
+    .live-badge {{
+      background: #cc2200; color: #fff; font-size: 11px; font-weight: 700;
+      letter-spacing: .08em; padding: 3px 8px; border-radius: 5px; flex-shrink: 0;
+    }}
+    .live-time {{ font-size: 17px; font-weight: 600; }}
+    .live-sub  {{ font-size: 12px; color: #555; margin-top: 2px; }}
+    audio {{
+      width: 100%; height: 48px; margin-bottom: 20px;
+      border-radius: 8px; accent-color: var(--accent);
+    }}
+    .tz-tabs {{ display: flex; gap: 8px; }}
+    .tz-tabs a {{
+      flex: 1; text-align: center; padding: 10px 0; border-radius: 10px;
+      background: #222; color: #888; text-decoration: none;
+      font-size: 13px; font-weight: 600; letter-spacing: .03em;
+      transition: background .15s, color .15s;
+    }}
+    .tz-tabs a.active {{ background: var(--accent); color: #fff; }}
+    .tz-tabs a:hover:not(.active) {{ background: #2a2a2a; color: #ccc; }}
+    .tz-tabs a.live {{ color: #cc2200; }}
+    .tz-tabs a.live.active, .tz-tabs a.live:hover {{ background: #cc2200; color: #fff; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="logo-wrap">&#128251;</div>
+      <div>
+        <div class="name">{display_name}</div>
+        <div class="sub">{name if name_local else ''}{' &middot; ' if name_local else ''}{desc}</div>
+      </div>
+    </div>
+
+    <div class="live-banner">
+      <span class="live-badge">LIVE</span>
+      <div>
+        <div class="live-time">{source_time}</div>
+        <div class="live-sub">Broadcasting now</div>
+      </div>
+    </div>
+
+    <audio controls autoplay>
+      <source src="/stream/live" type="audio/mpeg">
+    </audio>
+
+    <div class="tz-tabs">
+      {tabs}
+    </div>
+  </div>
 </body>
 </html>"""
 
@@ -537,11 +636,18 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/stream/"):
             slug = path[len("/stream/"):]
+            if slug == "live":
+                self._serve_live_stream()
+                return
             iana = tz_routes().get(slug.upper())
             if iana:
                 self._serve_stream(slug, iana)
             else:
                 self._text(404, "Unknown stream.\n")
+            return
+
+        if path == "/live":
+            self._html(200, html_live())
             return
 
         if path == "/":
@@ -617,6 +723,31 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
                 current = chunk_path(dt + datetime.timedelta(hours=1))
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    def _serve_live_stream(self):
+        try:
+            req = urllib.request.urlopen(STREAM_URL(), timeout=10)
+        except Exception as e:
+            self._text(502, f"Could not connect to source stream: {e}\n")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("icy-name", f"{station().get('name', 'Radio')} (Live)")
+        self.send_header("icy-br", str(BITRATE_KBPS()))
+        self.end_headers()
+        try:
+            while True:
+                data = req.read(8192)
+                if not data:
+                    break
+                self.wfile.write(data)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            req.close()
 
     def _html(self, code: int, body: str):
         b = body.encode("utf-8")
