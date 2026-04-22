@@ -797,6 +797,7 @@ def recording_loop():
     global _active_ffmpeg
     CACHE_DIR().mkdir(parents=True, exist_ok=True)
     log(f"Recording {STREAM_URL()}")
+    clean_old_chunks()
 
     while True:
         now = utcnow()
@@ -804,39 +805,39 @@ def recording_loop():
         duration = max(1, int((next_hour - now).total_seconds()))
         out = chunk_path(now)
 
-        # Preserve chunks that already have real data (e.g. after a daemon restart)
-        if out.exists() and out.stat().st_size >= MIN_CHUNK_BYTES:
-            log(f"Chunk {out.name} already has data, waiting for next hour")
-            while utcnow() < next_hour:
-                time.sleep(5)
-            clean_old_chunks()
-            continue
-
-        # Remove stubs so ffmpeg doesn't fail on an existing file
-        if out.exists():
+        # Drop sub-1MB stubs from previous interrupted starts
+        if out.exists() and out.stat().st_size < MIN_CHUNK_BYTES:
             out.unlink()
 
-        log(f"Recording {out.name} for {duration}s")
-        _active_ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-i", STREAM_URL(), "-t", str(duration), "-c", "copy", str(out)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        action = "Resuming" if out.exists() else "Recording"
+        log(f"{action} {out.name} for {duration}s")
 
-        while True:
-            ret = _active_ffmpeg.poll()
-            if ret is not None:
-                log(f"ffmpeg exited ({ret}), retrying in 5s")
-                time.sleep(5)
-                break
-            if utcnow() >= next_hour:
-                _active_ffmpeg.terminate()
-                try:
-                    _active_ffmpeg.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    _active_ffmpeg.kill()
-                log(f"Chunk {out.name} complete")
-                break
-            time.sleep(1)
+        # Append mode: creates the file if new, appends if resuming after a gap
+        out_fh = open(out, "ab")
+        try:
+            _active_ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-i", STREAM_URL(), "-t", str(duration),
+                 "-c", "copy", "-f", "mp3", "pipe:1"],
+                stdout=out_fh, stderr=subprocess.DEVNULL,
+            )
+
+            while True:
+                ret = _active_ffmpeg.poll()
+                if ret is not None:
+                    log(f"ffmpeg exited ({ret}), retrying in 5s")
+                    time.sleep(5)
+                    break
+                if utcnow() >= next_hour:
+                    _active_ffmpeg.terminate()
+                    try:
+                        _active_ffmpeg.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        _active_ffmpeg.kill()
+                    log(f"Chunk {out.name} complete")
+                    break
+                time.sleep(1)
+        finally:
+            out_fh.close()
 
         clean_old_chunks()
 
