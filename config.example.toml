@@ -1,0 +1,81 @@
+# radioshift — example configuration
+#
+# Copy this file to config.toml and edit it for your station.
+# Run: python radioshift.py start
+
+[station]
+# Station display name (used in the page title and player)
+name = "Galgalatz"
+
+# Optional: station name in its native script (shown large in the UI)
+# Remove this line if not needed
+name_local = "גַּלְגַּלְצ"
+
+# Subtitle shown below the name
+description = "IDF Radio"
+
+# Direct URL to the MP3/AAC stream
+stream_url = "http://glzwizzlv.bynetcdn.com/glglz_mp3"
+
+# IANA timezone of the source station — used to compute per-listener delays
+# so that listeners hear the station at the same local time of day.
+# Examples: Asia/Jerusalem, Europe/London, Europe/Paris, America/Sao_Paulo
+source_timezone = "Asia/Jerusalem"
+
+# Stream bitrate in kbps — used to seek to the right position within a chunk.
+# Check the station's stream headers if unsure; 128 is a common default.
+bitrate_kbps = 128
+
+# Accent color for the web UI (any valid CSS color)
+accent_color = "#0d9e55"
+
+
+[server]
+# Port for the local HTTP server (Caddy/nginx proxies this to your domain)
+port = 8765
+
+# Where to store recorded chunks. Relative paths are resolved from this file's directory.
+cache_dir = "./cache"
+
+# How many hours of audio to keep on disk.
+# Must be at least max_delay + 1. For US timezones + Israel: 13h covers all DST scenarios.
+max_age_hours = 13
+
+
+# Listener timezones — one entry per timezone you want to serve.
+# Each label becomes a URL path: /et  /ct  /mt  /pt  etc.
+# Labels are case-insensitive; use whatever makes sense for your audience.
+# Values must be valid IANA timezone names.
+[timezones]
+ET = "America/New_York"
+CT = "America/Chicago"
+MT = "America/Denver"
+PT = "America/Los_Angeles"
+
+
+# ── Other station examples ────────────────────────────────────────────────────
+#
+# BBC Radio 4 (London → US East Coast)
+# [station]
+# name            = "BBC Radio 4"
+# description     = "BBC"
+# stream_url      = "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm"
+# source_timezone = "Europe/London"
+# bitrate_kbps    = 128
+# accent_color    = "#bb1919"
+# [timezones]
+# ET = "America/New_York"
+# CT = "America/Chicago"
+# PT = "America/Los_Angeles"
+#
+# Antena 1 (Lisbon → US/Brazil)
+# [station]
+# name            = "Antena 1"
+# description     = "RTP Radio"
+# stream_url      = "https://streaming.rtp.pt/live/a1/a1.aac"
+# source_timezone = "Europe/Lisbon"
+# bitrate_kbps    = 128
+# accent_color    = "#006600"
+# [timezones]
+# ET  = "America/New_York"
+# BRT = "America/Sao_Paulo"
