@@ -520,27 +520,6 @@ def _player_js() -> str:
     muteBtn.classList.toggle('active', !m);
   }
 
-  setMuted(wantsMuted);
-  audio.play().catch(function() {
-    // Autoplay blocked — keep user's saved preference but show tap-to-start
-    muteIcon.textContent = '▶';
-    muteLbl.textContent  = 'Tap to start';
-    muteBtn.classList.remove('active');
-  });
-
-  if (muteBtn) muteBtn.addEventListener('click', function() {
-    var blocked = muteLbl.textContent === 'Tap to start';
-    if (blocked) {
-      // First click after autoplay was blocked — start playing with saved preference
-      wantsMuted = localStorage.getItem('muted') === '1';
-    } else {
-      wantsMuted = !wantsMuted;
-      localStorage.setItem('muted', wantsMuted ? '1' : '0');
-    }
-    setMuted(wantsMuted);
-    audio.play().catch(function(){});
-  });
-
   // ── Skip-news toggle ─────────────────────────────────────────────────────
   function streamSrc(slug, skip) {
     var base = '/stream/' + (slug === 'live' ? 'live' : slug);
@@ -566,8 +545,29 @@ def _player_js() -> str:
     }
   }
   applySkip(skipOn, false);
-  // Reconnect with correct ?skip param on initial load
+
+  // Set correct src (with ?skip if needed) before first play
+  setMuted(wantsMuted);
   audio.src = streamSrc(currentSlug(), skipOn);
+  audio.play().catch(function() {
+    // Autoplay blocked — show tap-to-start
+    muteIcon.textContent = '▶';
+    muteLbl.textContent  = 'Tap to start';
+    muteBtn.classList.remove('active');
+  });
+
+  if (muteBtn) muteBtn.addEventListener('click', function() {
+    var blocked = muteLbl.textContent === 'Tap to start';
+    if (blocked) {
+      // First click after autoplay blocked — honor saved preference
+      wantsMuted = localStorage.getItem('muted') === '1';
+    } else {
+      wantsMuted = !wantsMuted;
+      localStorage.setItem('muted', wantsMuted ? '1' : '0');
+    }
+    setMuted(wantsMuted);
+    audio.play().catch(function(){});
+  });
   if (skipBtn) skipBtn.addEventListener('click', function() {
     applySkip(!skipOn, true);
   });
