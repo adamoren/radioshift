@@ -131,3 +131,5 @@ radioshift is free and open source. If it's useful to you:
 ## License
 
 MIT
+
+News-break fill music: "Local Forecast - Elevator" by Kevin MacLeod (incompetech.com), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
