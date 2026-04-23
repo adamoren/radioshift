@@ -118,7 +118,7 @@ After starting, each timezone stream becomes available after its delay has elaps
 You need a Linux server with Python 3.11+ and ffmpeg. A $6/month VPS is plenty for a family-sized audience.
 
 - **Hetzner** (recommended — fast, cheap, European) → [get €20 credit](https://hetzner.cloud/?ref=PLACEHOLDER)
-- **DigitalOcean** → [get $200 credit for 60 days](https://www.digitalocean.com/?refcode=PLACEHOLDER)
+- **DigitalOcean** → [get $200 credit for 60 days](https://m.do.co/c/ca7aa9ddeb9a)
 
 ## Support
 
