@@ -43,7 +43,31 @@ python radioshift.py [--config config.toml] status  # show buffer and stream sta
 |---|---|
 | `/` | Redirects to the first configured timezone |
 | `/<tz>` | Web player for that timezone (e.g. `/et`, `/pt`) |
+| `/live` | Web player for the live stream |
 | `/stream/<tz>` | Raw MP3 stream — use in any audio player or `ffplay` |
+| `/stream/live` | Raw MP3 live stream |
+| `/stream/<tz>.m3u` | M3U playlist — use with CarPlay / Android Auto apps |
+| `/stream/live.m3u` | M3U playlist for the live stream |
+
+## CarPlay and Android Auto
+
+The web player doesn't run inside CarPlay or Android Auto, but the M3U playlist links make it easy to add the stream to a compatible radio app that does.
+
+**iOS / CarPlay and Android / Android Auto**
+
+[VLC](https://www.videolan.org/vlc/) is free and works on both platforms with CarPlay and Android Auto support.
+
+1. Install VLC from the App Store or Google Play.
+2. On the player page, tap **"How to play in your car"** and then **"Get stream link"** — open the downloaded file with VLC.
+3. Connect your phone to your car. VLC will appear in CarPlay or Android Auto with the station ready to play.
+
+Alternatively, add the stream URL directly in VLC's network stream dialog:
+```
+https://your-domain.com/stream/et.m3u
+```
+(replace `et` with your timezone slug)
+
+The player page also has a **"Get stream link"** button that downloads the `.m3u` file directly — tap it on your phone, open it with Triode or VLC, and save it as a station.
 
 ## Configuration
 

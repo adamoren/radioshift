@@ -29,6 +29,11 @@ bitrate_kbps = 128
 # Accent color for the web UI (any valid CSS color)
 accent_color = "#0d9e55"
 
+# Set to true to automatically replace news/informational breaks with a
+# pleasant fill track (announcement + ambient music), preserving the timeshift.
+# Requires news_break_fill.mp3 alongside radioshift.py.
+skip_news = false
+
 
 [server]
 # Port for the local HTTP server (Caddy/nginx proxies this to your domain)

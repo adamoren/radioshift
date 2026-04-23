@@ -75,6 +75,7 @@ def SOURCE_TZ()    -> str:   return station()["source_timezone"]
 def BITRATE_KBPS() -> int:   return int(station().get("bitrate_kbps", 128))
 def BYTES_PER_SEC()-> int:   return BITRATE_KBPS() * 1000 // 8
 def ACCENT()       -> str:   return station().get("accent_color", "#0077cc")
+def SKIP_NEWS()    -> bool:  return bool(station().get("skip_news", False))
 
 _active_ffmpeg: Optional[subprocess.Popen] = None
 
@@ -113,7 +114,7 @@ def delay_hours_for_tz(iana: str) -> float:
 
 def fmt_local(utc_dt: datetime.datetime, iana: str) -> str:
     aware = utc_dt.replace(tzinfo=datetime.timezone.utc).astimezone(ZoneInfo(iana))
-    return aware.strftime("%-I:%M %p %Z")
+    return aware.strftime("%-I:%M:%S %p %Z")
 
 
 def fmt_source(utc_dt: datetime.datetime) -> str:
@@ -154,12 +155,177 @@ def clean_old_chunks():
         try:
             if dt < cutoff:
                 f.unlink()
+                for sidecar in (mod_chunk(f),):
+                    if sidecar.exists():
+                        sidecar.unlink()
                 log(f"Deleted old chunk: {f.name}")
             elif f != current and f.stat().st_size < MIN_CHUNK_BYTES:
                 f.unlink()
                 log(f"Deleted stub chunk: {f.name}")
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# News detection
+# ---------------------------------------------------------------------------
+
+_NEWS_SILENCE_DB   = -35.0  # dB — transition dip that marks news start
+_NEWS_START_WINDOW = 20     # seconds — silence must appear within this window
+_NEWS_SCAN_MAX     = 900    # seconds — scan up to this far to find music return
+_NEWS_MUSIC_DB     = -20.0  # dB — RMS threshold for "music resumed"
+_NEWS_MUSIC_RUN    = 8      # consecutive seconds above threshold = music
+
+
+def _rms_per_second(path: Path, duration: int) -> list:
+    """Return list of per-second RMS dB values for the first `duration` seconds."""
+    import re as _re
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(path), "-t", str(duration),
+         "-af", "astats=metadata=1:reset=1,"
+                "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    # Parse frame timestamps and RMS levels together; bucket by integer second
+    buckets: dict = {}
+    cur_sec = None
+    for line in result.stdout.splitlines():
+        m = _re.search(r"pts_time:([\d.]+)", line)
+        if m:
+            cur_sec = int(float(m.group(1)))
+            continue
+        m = _re.search(r"RMS_level=(-?\d+\.?\d*)", line)
+        if m and cur_sec is not None:
+            try:
+                v = float(m.group(1))
+                buckets.setdefault(cur_sec, []).append(v)
+            except ValueError:
+                pass
+    if not buckets:
+        return []
+    max_sec = max(buckets)
+    return [
+        min(buckets[s]) if s in buckets else 0.0
+        for s in range(max_sec + 1)
+    ]
+
+
+FILL_TRACK = Path(__file__).resolve().parent / "news_break_fill.mp3"
+
+
+def mod_chunk(chunk: Path) -> Path:
+    return chunk.with_suffix(".mod.mp3")
+
+
+def _find_news_segments(levels: list) -> list:
+    """
+    Scan per-second RMS levels for news/informational segments.
+    Returns list of (start_sec, end_sec) tuples.
+    A segment starts with a silence dip below _NEWS_SILENCE_DB within a
+    short window, and ends when sustained music resumes.
+    """
+    segments = []
+    i = 0
+    n = len(levels)
+    while i < n:
+        # Look for silence dip (news jingle transition)
+        if levels[i] < _NEWS_SILENCE_DB:
+            seg_start = max(0, i - 2)  # back up a couple seconds to include jingle onset
+            # Find where music returns
+            run = 0
+            j = i + 1
+            while j < n:
+                if levels[j] > _NEWS_MUSIC_DB:
+                    run += 1
+                    if run >= _NEWS_MUSIC_RUN:
+                        seg_end = j - _NEWS_MUSIC_RUN + 1
+                        if seg_end > seg_start + 30:  # ignore very short blips
+                            segments.append((seg_start, seg_end))
+                        i = seg_end
+                        break
+                else:
+                    run = 0
+                j += 1
+            else:
+                break  # silence never recovered — stop scanning
+        i += 1
+    return segments
+
+
+def detect_and_save_news_skip(chunk: Path):
+    """Scan completed chunk for news/informational segments and bake a .mod.mp3."""
+    mc = mod_chunk(chunk)
+    if mc.exists():
+        return  # already processed
+
+    log(f"Scanning {chunk.name} for news segments...")
+    levels = _rms_per_second(chunk, _NEWS_SCAN_MAX)
+    segments = _find_news_segments(levels)
+
+    if not segments:
+        log(f"No news segments found in {chunk.name}")
+        return
+
+    for start, end in segments:
+        log(f"  News segment: {start}s–{end}s ({end-start}s)")
+
+    if not FILL_TRACK.exists():
+        log("news_break_fill.mp3 not found — cannot substitute news")
+        return
+
+    # Build ffmpeg filter: splice fill track into each news segment
+    inputs = ["ffmpeg", "-i", str(chunk)]
+    filter_parts = []
+    concat_inputs = []
+    seg_idx = 0
+    prev_end = 0
+
+    for start, end in segments:
+        dur = end - start
+        # Pre-news segment
+        label_pre = f"pre{seg_idx}"
+        filter_parts.append(
+            f"[0:a]atrim={prev_end}:{start},asetpts=PTS-STARTPTS[{label_pre}]"
+        )
+        concat_inputs.append(f"[{label_pre}]")
+        # Fill segment (trimmed from fill track)
+        inputs += ["-i", str(FILL_TRACK)]
+        fill_idx = seg_idx + 1
+        label_fill = f"fill{seg_idx}"
+        filter_parts.append(
+            f"[{fill_idx}:a]atrim=0:{dur},asetpts=PTS-STARTPTS[{label_fill}]"
+        )
+        concat_inputs.append(f"[{label_fill}]")
+        prev_end = end
+        seg_idx += 1
+
+    # Post-last-segment tail
+    label_tail = "tail"
+    filter_parts.append(
+        f"[0:a]atrim={prev_end},asetpts=PTS-STARTPTS[{label_tail}]"
+    )
+    concat_inputs.append(f"[{label_tail}]")
+
+    n_segs = len(concat_inputs)
+    filter_parts.append(
+        f"{''.join(concat_inputs)}concat=n={n_segs}:v=0:a=1[out]"
+    )
+    filter_str = ";".join(filter_parts)
+
+    tmp = mc.with_name(mc.stem + ".tmp.mp3")
+    result = subprocess.run(
+        inputs + ["-filter_complex", filter_str, "-map", "[out]",
+                  "-b:a", f"{BITRATE_KBPS()}k", "-f", "mp3", "-y", str(tmp)],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        tmp.rename(mc)
+        log(f"Wrote {mc.name} with {len(segments)} segment(s) substituted")
+    else:
+        log(f"ffmpeg mod failed for {chunk.name}: {result.stderr[-200:].decode(errors='replace')}")
+        if tmp.exists():
+            tmp.unlink()
 
 
 def read_pid() -> Optional[int]:
@@ -281,6 +447,133 @@ def _tz_suggest_js(current_slug: str) -> str:
 </script>"""
 
 
+def _clock_js(source_iana: str, local_iana: str, target_utc_ms: int) -> str:
+    """
+    Ticks the unified clock display every second.
+    The playback moment is the same in both timezones — show one time, two labels.
+    source ticks from target_utc_ms (playback position, not current time).
+    """
+    now_aware  = datetime.datetime.now(datetime.timezone.utc)
+    src_abbr   = now_aware.astimezone(ZoneInfo(source_iana)).strftime("%Z")
+    local_abbr = now_aware.astimezone(ZoneInfo(local_iana)).strftime("%Z") if local_iana != source_iana else ""
+    tz_label   = f"{src_abbr} · {local_abbr}" if local_abbr else src_abbr
+    return f"""<script>
+(function(){{
+  var timeEl = document.getElementById('shared-time');
+  if (!timeEl) return;
+
+  var fmt = new Intl.DateTimeFormat('en-US', {{
+    hour: 'numeric', minute: '2-digit', second: '2-digit',
+    hour12: true, timeZone: '{source_iana}'
+  }});
+
+  var targetMs = {target_utc_ms};
+  var loadedAt = Date.now();
+
+  function tick() {{
+    timeEl.textContent = fmt.format(new Date(targetMs + (Date.now() - loadedAt)));
+  }}
+  tick();
+  setInterval(tick, 1000);
+}})();
+</script>"""
+
+
+def _player_js() -> str:
+    """Mute toggle + skip-news toggle + tab switching."""
+    return """<script>
+(function(){
+  var audio    = document.getElementById('player') || document.querySelector('audio');
+  if (!audio) return;
+
+  var muteBtn  = document.getElementById('mute-btn');
+  var muteIcon = document.getElementById('mute-icon');
+  var muteLbl  = document.getElementById('mute-label');
+  var skipBtn  = document.getElementById('skip-btn');
+  var skipIcon = document.getElementById('skip-icon');
+  var skipLbl  = document.getElementById('skip-label');
+
+  // ── Mute ────────────────────────────────────────────────────────────────
+  var wantsMuted = localStorage.getItem('muted') === '1';  // default: unmuted
+
+  function setMuted(m) {
+    audio.muted = m;
+    muteIcon.textContent = m ? '🔇' : '🔊';
+    muteLbl.textContent  = m ? 'Unmute' : 'Mute';
+    muteBtn.classList.toggle('active', !m);
+  }
+
+  setMuted(wantsMuted);
+  audio.play().catch(function() {
+    // Autoplay blocked — keep user's saved preference but show tap-to-start
+    muteIcon.textContent = '▶';
+    muteLbl.textContent  = 'Tap to start';
+    muteBtn.classList.remove('active');
+  });
+
+  if (muteBtn) muteBtn.addEventListener('click', function() {
+    var blocked = muteLbl.textContent === 'Tap to start';
+    if (blocked) {
+      // First click after autoplay was blocked — start playing with saved preference
+      wantsMuted = localStorage.getItem('muted') === '1';
+    } else {
+      wantsMuted = !wantsMuted;
+      localStorage.setItem('muted', wantsMuted ? '1' : '0');
+    }
+    setMuted(wantsMuted);
+    audio.play().catch(function(){});
+  });
+
+  // ── Skip-news toggle ─────────────────────────────────────────────────────
+  function streamSrc(slug, skip) {
+    var base = '/stream/' + (slug === 'live' ? 'live' : slug);
+    return skip ? base + '?skip=1' : base;
+  }
+  function currentSlug() {
+    return window.location.pathname.replace(/^\\//, '') || 'et';
+  }
+  var skipOn = localStorage.getItem('skip-news') === '1';
+  function applySkip(on, reconnect) {
+    skipOn = on;
+    localStorage.setItem('skip-news', on ? '1' : '0');
+    if (skipBtn) {
+      skipBtn.classList.toggle('skip-on', on);
+      skipIcon.textContent = on ? '✅' : '📰';
+      skipLbl.textContent  = on ? 'News skipped' : 'Skip news';
+    }
+    if (reconnect) {
+      var wasMuted = audio.muted;
+      audio.src = streamSrc(currentSlug(), on);
+      audio.muted = wasMuted;
+      audio.play().catch(function(){});
+    }
+  }
+  applySkip(skipOn, false);
+  // Reconnect with correct ?skip param on initial load
+  audio.src = streamSrc(currentSlug(), skipOn);
+  if (skipBtn) skipBtn.addEventListener('click', function() {
+    applySkip(!skipOn, true);
+  });
+
+  // ── Tab switching ────────────────────────────────────────────────────────
+  document.querySelectorAll('.tz-tabs a').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      var href = this.getAttribute('href');
+      var slug = href.replace(/^\\//, '');
+      var wasMuted = audio.muted;
+      audio.src = streamSrc(slug, skipOn);
+      audio.muted = wasMuted;
+      audio.play().catch(function(){});
+      document.querySelectorAll('.tz-tabs a').forEach(function(t) { t.classList.remove('active'); });
+      this.classList.add('active');
+      history.pushState({}, '', href);
+    });
+  });
+})();
+</script>"""
+
+
 def _tz_tabs(active_tz: str) -> str:
     tabs = ""
     for label, iana in tz_routes().items():
@@ -299,11 +592,15 @@ def html_player(tz: str, iana: str, delay: float,
     name_local = s.get("name_local", "")
     desc       = s.get("description", "")
     accent     = ACCENT()
-    source_time = fmt_source(target_dt)
-    local_time  = fmt_local(target_dt, iana)
-    tz_label    = tz.upper()
-    tabs        = _tz_tabs(tz)
+    source_time  = fmt_source(target_dt)
+    now_aware    = datetime.datetime.now(datetime.timezone.utc)
+    src_abbr     = now_aware.astimezone(ZoneInfo(SOURCE_TZ())).strftime("%Z")
+    local_abbr   = now_aware.astimezone(ZoneInfo(iana)).strftime("%Z")
+    tz_pair      = f"{src_abbr} · {local_abbr}" if src_abbr != local_abbr else src_abbr
+    tz_label     = tz.upper()
+    tabs         = _tz_tabs(tz)
     display_name = name_local if name_local else name
+    target_ms    = int((target_dt - datetime.datetime(1970, 1, 1)).total_seconds() * 1000)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -347,41 +644,32 @@ def html_player(tz: str, iana: str, delay: float,
     .name {{ font-size: 26px; font-weight: 700; letter-spacing: -.5px; }}
     .sub  {{ font-size: 13px; color: #777; margin-top: 2px; }}
     .times {{
-      background: #111;
-      border-radius: 12px;
-      padding: 14px 18px;
-      margin-bottom: 24px;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px 0;
+      background: #111; border-radius: 12px; padding: 16px 18px;
+      margin-bottom: 20px; text-align: center;
     }}
-    .times .label {{ font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: .05em; }}
-    .times .value {{ font-size: 17px; font-weight: 600; margin-top: 2px; }}
-    .times .value.src {{ color: var(--accent); }}
+    .times .clock {{ font-size: 28px; font-weight: 700; color: var(--accent); letter-spacing: -.5px; font-variant-numeric: tabular-nums; }}
+    .times .tz-pair {{ font-size: 12px; color: #555; margin-top: 5px; letter-spacing: .05em; }}
     .delay-note {{
-      grid-column: 1 / -1;
-      font-size: 12px;
-      color: #444;
-      padding-top: 8px;
-      border-top: 1px solid #222;
-      margin-top: 4px;
+      font-size: 12px; color: #444; margin-top: 10px;
+      padding-top: 10px; border-top: 1px solid #1e1e1e;
     }}
     .dot {{
-      display: inline-block;
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: var(--accent);
-      margin-right: 5px;
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent); margin-right: 5px;
       animation: pulse 1.6s ease-in-out infinite;
     }}
     @keyframes pulse {{ 0%,100%{{ opacity:1 }} 50%{{ opacity:.25 }} }}
-    audio {{
-      width: 100%;
-      height: 48px;
-      margin-bottom: 20px;
-      border-radius: 8px;
-      accent-color: var(--accent);
+    .controls {{ display: flex; gap: 8px; margin-bottom: 16px; }}
+    .ctrl-btn {{
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      gap: 8px; background: #222; border: none; border-radius: 10px;
+      color: #666; padding: 13px 0; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: background .15s, color .15s; font-family: inherit;
     }}
+    .ctrl-btn:hover {{ background: #2a2a2a; color: #999; }}
+    .ctrl-btn.active {{ background: var(--accent); color: #fff; }}
+    #skip-btn.skip-on {{ background: #1a3a1a; color: #4caf50; }}
+    #skip-btn.skip-on:hover {{ background: #223a22; }}
     .tz-tabs {{ display: flex; gap: 8px; }}
     .tz-tabs a {{
       flex: 1;
@@ -400,6 +688,49 @@ def html_player(tz: str, iana: str, delay: float,
     .tz-tabs a:hover:not(.active) {{ background: #2a2a2a; color: #ccc; }}
     .tz-tabs a.live {{ color: #cc2200; }}
     .tz-tabs a.live.active, .tz-tabs a.live:hover {{ background: #cc2200; color: #fff; }}
+    .car-trigger {{
+      width: 100%; margin-top: 14px; padding: 11px 0;
+      background: none; border: 1px solid #2a2a2a; border-radius: 10px;
+      color: #555; font-size: 13px; font-weight: 600; cursor: pointer;
+      transition: border-color .15s, color .15s; font-family: inherit;
+    }}
+    .car-trigger:hover {{ border-color: #444; color: #888; }}
+    .car-modal {{
+      display: none; position: fixed; inset: 0; z-index: 100;
+      align-items: flex-end; justify-content: center;
+      background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+    }}
+    .car-modal.open {{ display: flex; }}
+    .car-sheet {{
+      background: #1a1a1a; border-radius: 20px 20px 0 0;
+      width: min(460px, 100vw); padding: 28px 28px 36px;
+      border-top: 1px solid #2a2a2a;
+    }}
+    .car-sheet h3 {{ font-size: 16px; font-weight: 700; margin-bottom: 18px; color: #f0f0f0; }}
+    .car-steps {{ list-style: none; display: flex; flex-direction: column; gap: 12px; }}
+    .car-steps li {{ display: flex; gap: 12px; align-items: flex-start; font-size: 13px; color: #aaa; line-height: 1.5; }}
+    .car-steps .num {{
+      background: #2a2a2a; color: #fff; border-radius: 50%;
+      width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 700; flex-shrink: 0; margin-top: 1px;
+    }}
+    .car-steps strong {{ color: #f0f0f0; }}
+    .car-divider {{ border: none; border-top: 1px solid #2a2a2a; margin: 18px 0; }}
+    .car-dl {{
+      display: flex; align-items: center; justify-content: space-between;
+      background: #222; border-radius: 10px; padding: 12px 16px;
+    }}
+    .car-dl-label {{ font-size: 12px; color: #777; }}
+    .car-dl-btn {{
+      background: var(--accent); color: #fff; border-radius: 7px;
+      padding: 7px 14px; text-decoration: none; font-size: 12px; font-weight: 700;
+    }}
+    .car-close {{
+      width: 100%; margin-top: 14px; padding: 12px 0;
+      background: #222; border: none; border-radius: 10px;
+      color: #888; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
+    }}
+    .car-close:hover {{ background: #2a2a2a; color: #fff; }}
   </style>
 </head>
 <body>
@@ -413,28 +744,77 @@ def html_player(tz: str, iana: str, delay: float,
     </div>
 
     <div class="times">
-      <div>
-        <div class="label">Source time</div>
-        <div class="value src">{source_time}</div>
-      </div>
-      <div>
-        <div class="label">Your time ({tz_label})</div>
-        <div class="value">{local_time}</div>
-      </div>
+      <div class="clock" id="shared-time">{source_time}</div>
+      <div class="tz-pair">{tz_pair}</div>
       <div class="delay-note">
         <span class="dot"></span>Playing {delay:.0f}h behind live
       </div>
     </div>
 
-    <audio controls autoplay>
-      <source src="/stream/{tz}" type="audio/mpeg">
-    </audio>
+    <audio autoplay src="/stream/{tz}" id="player"></audio>
+
+    <div class="controls">
+      <button class="ctrl-btn" id="mute-btn">
+        <span id="mute-icon">🔇</span>
+        <span id="mute-label">Tap to listen</span>
+      </button>
+      <button class="ctrl-btn" id="skip-btn" title="Replace news breaks with ambient music">
+        <span id="skip-icon">📰</span>
+        <span id="skip-label">Skip news</span>
+      </button>
+    </div>
 
     <div class="tz-tabs">
       {tabs}
     </div>
+
+    <button class="car-trigger" onclick="document.getElementById('car-modal').classList.add('open')">
+      &#128664; How to play in your car
+    </button>
+  </div>
+
+  <div class="car-modal" id="car-modal" onclick="if(event.target===this)this.classList.remove('open')">
+    <div class="car-sheet">
+      <h3>&#128664; Play in your car</h3>
+      <ol class="car-steps">
+        <li>
+          <span class="num">1</span>
+          <span>Install <strong>VLC</strong> (free) from the App Store or Google Play.</span>
+        </li>
+        <li>
+          <span class="num">2</span>
+          <span>Tap <strong>Copy stream URL</strong> below, then open VLC &rarr; <strong>Network</strong> tab &rarr; tap the URL bar and paste.</span>
+        </li>
+        <li>
+          <span class="num">3</span>
+          <span>VLC will start playing. Connect your phone to your car and open VLC from <strong>CarPlay</strong> or <strong>Android Auto</strong>.</span>
+        </li>
+      </ol>
+      <hr class="car-divider">
+      <div class="car-dl">
+        <span class="car-dl-label" id="vlc-url-label" style="font-size:11px;word-break:break-all;color:#555;flex:1;margin-right:12px;"></span>
+        <button class="car-dl-btn" id="copy-url-btn" onclick="copyStreamUrl()">Copy URL</button>
+      </div>
+      <script>
+        (function(){{
+          var url = location.protocol + '//' + location.host + '/stream/{tz}';
+          document.getElementById('vlc-url-label').textContent = url;
+        }})();
+        function copyStreamUrl() {{
+          var url = location.protocol + '//' + location.host + '/stream/{tz}';
+          navigator.clipboard.writeText(url).then(function() {{
+            var btn = document.getElementById('copy-url-btn');
+            btn.textContent = 'Copied ✓';
+            setTimeout(function() {{ btn.textContent = 'Copy URL'; }}, 2000);
+          }});
+        }}
+      </script>
+      <button class="car-close" onclick="document.getElementById('car-modal').classList.remove('open')">Close</button>
+    </div>
   </div>
 {_tz_suggest_js(tz)}
+{_clock_js(SOURCE_TZ(), iana, target_ms)}
+{_player_js()}
 </body>
 </html>"""
 
@@ -488,10 +868,15 @@ def html_live() -> str:
     }}
     .live-time {{ font-size: 17px; font-weight: 600; }}
     .live-sub  {{ font-size: 12px; color: #555; margin-top: 2px; }}
-    audio {{
-      width: 100%; height: 48px; margin-bottom: 20px;
-      border-radius: 8px; accent-color: var(--accent);
+    .controls {{ margin-bottom: 20px; }}
+    .mute-btn {{
+      width: 100%; display: flex; align-items: center; justify-content: center;
+      gap: 10px; background: #222; border: none; border-radius: 10px;
+      color: #666; padding: 13px 0; font-size: 15px; font-weight: 600;
+      cursor: pointer; transition: background .15s, color .15s; font-family: inherit;
     }}
+    .mute-btn:hover {{ background: #2a2a2a; color: #999; }}
+    .mute-btn.active {{ background: #cc2200; color: #fff; }}
     .tz-tabs {{ display: flex; gap: 8px; }}
     .tz-tabs a {{
       flex: 1; text-align: center; padding: 10px 0; border-radius: 10px;
@@ -518,19 +903,26 @@ def html_live() -> str:
     <div class="live-banner">
       <span class="live-badge">LIVE</span>
       <div>
-        <div class="live-time">{source_time}</div>
+        <div class="live-time" id="source-time">{source_time}</div>
         <div class="live-sub">Broadcasting now</div>
       </div>
     </div>
 
-    <audio controls autoplay>
-      <source src="/stream/live" type="audio/mpeg">
-    </audio>
+    <audio autoplay src="/stream/live"></audio>
+
+    <div class="controls">
+      <button class="mute-btn" id="mute-btn">
+        <span id="mute-icon">🔇</span>
+        <span id="mute-label">Tap to listen</span>
+      </button>
+    </div>
 
     <div class="tz-tabs">
       {tabs}
     </div>
   </div>
+{_clock_js(SOURCE_TZ(), SOURCE_TZ(), int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))}
+{_player_js()}
 </body>
 </html>"""
 
@@ -656,6 +1048,17 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
             if slug == "live":
                 self._serve_live_stream()
                 return
+            if slug.endswith(".m3u"):
+                slug = slug[:-4]
+                iana = tz_routes().get(slug.upper())
+                if iana:
+                    self._serve_m3u(slug)
+                else:
+                    self._text(404, "Unknown timezone.\n")
+                return
+            if slug == "live.m3u":
+                self._serve_m3u("live")
+                return
             iana = tz_routes().get(slug.upper())
             if iana:
                 self._serve_stream(slug, iana)
@@ -709,6 +1112,10 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
 
         seek_sec = int((target_dt - hour_floor(target_dt)).total_seconds())
         seek_bytes = seek_sec * BYTES_PER_SEC()
+        skip_requested = "skip=1" in self.path
+        mc = mod_chunk(target_chunk)
+        if (skip_requested or SKIP_NEWS()) and mc.exists():
+            target_chunk = mc
 
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
@@ -765,6 +1172,26 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
             pass
         finally:
             req.close()
+
+    def _serve_m3u(self, slug: str):
+        name = station().get("name", "Radio")
+        host = self.headers.get("Host", f"localhost:{HTTP_PORT()}")
+        scheme = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
+        base = f"{scheme}://{host}"
+        if slug == "live":
+            title = f"{name} — Live"
+            stream = f"{base}/stream/live"
+        else:
+            delay = delay_hours_for_tz(tz_routes()[slug.upper()])
+            title = f"{name} ({slug.upper()} -{delay:.0f}h)"
+            stream = f"{base}/stream/{slug}"
+        body = f"#EXTM3U\n#EXTINF:-1,{title}\n{stream}\n"
+        b = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/x-mpegurl")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
     def _html(self, code: int, body: str):
         b = body.encode("utf-8")
@@ -834,6 +1261,11 @@ def recording_loop():
                     except subprocess.TimeoutExpired:
                         _active_ffmpeg.kill()
                     log(f"Chunk {out.name} complete")
+                    if SKIP_NEWS():
+                        threading.Thread(
+                            target=detect_and_save_news_skip,
+                            args=(out,), daemon=True,
+                        ).start()
                     break
                 time.sleep(1)
         finally:
