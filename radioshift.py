@@ -168,14 +168,12 @@ def clean_old_chunks():
         if not dt:
             continue
         try:
-            misaligned = not _is_aligned(f)
-            if dt < cutoff or misaligned:
+            if dt < cutoff:
                 f.unlink()
                 for sidecar in (mod_chunk(f),):
                     if sidecar.exists():
                         sidecar.unlink()
-                reason = "misaligned" if misaligned else "old"
-                log(f"Deleted {reason} chunk: {f.name}")
+                log(f"Deleted old chunk: {f.name}")
             elif f != current and f.stat().st_size < MIN_CHUNK_BYTES:
                 f.unlink()
                 log(f"Deleted stub chunk: {f.name}")
