@@ -113,6 +113,21 @@ After starting, each timezone stream becomes available after its delay has elaps
 - The buffering page auto-refreshes every minute and shows an ETA
 - No data is lost during this time — recording starts immediately
 
+## Self-hosting
+
+You need a Linux server with Python 3.11+ and ffmpeg. A $6/month VPS is plenty for a family-sized audience.
+
+- **Hetzner** (recommended — fast, cheap, European) → [get €20 credit](https://hetzner.cloud/?ref=PLACEHOLDER)
+- **DigitalOcean** → [get $200 credit for 60 days](https://www.digitalocean.com/?refcode=PLACEHOLDER)
+
+## Support
+
+radioshift is free and open source. If it's useful to you:
+
+- ⭐ Star the repo
+- ☕ [Buy me a coffee](https://buymeacoffee.com/PLACEHOLDER)
+- [GitHub Sponsors](https://github.com/sponsors/adamoren)
+
 ## License
 
 MIT

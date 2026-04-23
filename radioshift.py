@@ -92,8 +92,17 @@ def hour_floor(dt: datetime.datetime) -> datetime.datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
+# Chunks start at :50 so the :56–:07 informational block always falls within one chunk.
+_CHUNK_OFFSET_MIN = 50
+
+def chunk_floor(dt: datetime.datetime) -> datetime.datetime:
+    """Round dt down to the most recent chunk boundary (:50 of each hour)."""
+    base = hour_floor(dt - datetime.timedelta(minutes=_CHUNK_OFFSET_MIN))
+    return base + datetime.timedelta(minutes=_CHUNK_OFFSET_MIN)
+
+
 def chunk_path(dt: datetime.datetime) -> Path:
-    return CACHE_DIR() / f"chunk_{hour_floor(dt).strftime('%Y%m%d_%H%M')}.mp3"
+    return CACHE_DIR() / f"chunk_{chunk_floor(dt).strftime('%Y%m%d_%H%M')}.mp3"
 
 
 def parse_chunk_dt(path: Path) -> Optional[datetime.datetime]:
@@ -145,6 +154,12 @@ def valid_chunks() -> list:
     ]
 
 
+def _is_aligned(path: Path) -> bool:
+    """Return True if this chunk file is on a :50 boundary."""
+    dt = parse_chunk_dt(path)
+    return dt is not None and dt.minute == _CHUNK_OFFSET_MIN
+
+
 def clean_old_chunks():
     cutoff = utcnow() - datetime.timedelta(hours=MAX_AGE_H())
     current = chunk_path(utcnow())
@@ -153,12 +168,14 @@ def clean_old_chunks():
         if not dt:
             continue
         try:
-            if dt < cutoff:
+            misaligned = not _is_aligned(f)
+            if dt < cutoff or misaligned:
                 f.unlink()
                 for sidecar in (mod_chunk(f),):
                     if sidecar.exists():
                         sidecar.unlink()
-                log(f"Deleted old chunk: {f.name}")
+                reason = "misaligned" if misaligned else "old"
+                log(f"Deleted {reason} chunk: {f.name}")
             elif f != current and f.stat().st_size < MIN_CHUNK_BYTES:
                 f.unlink()
                 log(f"Deleted stub chunk: {f.name}")
@@ -1110,7 +1127,7 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
             self._text(503, "Stream not ready yet.\n")
             return
 
-        seek_sec = int((target_dt - hour_floor(target_dt)).total_seconds())
+        seek_sec = int((target_dt - chunk_floor(target_dt)).total_seconds())
         seek_bytes = seek_sec * BYTES_PER_SEC()
         skip_requested = "skip=1" in self.path
         mc = mod_chunk(target_chunk)
@@ -1228,7 +1245,7 @@ def recording_loop():
 
     while True:
         now = utcnow()
-        next_hour = hour_floor(now + datetime.timedelta(hours=1))
+        next_hour = chunk_floor(now) + datetime.timedelta(hours=1)
         duration = max(1, int((next_hour - now).total_seconds()))
         out = chunk_path(now)
 
@@ -1261,7 +1278,7 @@ def recording_loop():
                     except subprocess.TimeoutExpired:
                         _active_ffmpeg.kill()
                     log(f"Chunk {out.name} complete")
-                    if SKIP_NEWS():
+                    if FILL_TRACK.exists():
                         threading.Thread(
                             target=detect_and_save_news_skip,
                             args=(out,), daemon=True,
