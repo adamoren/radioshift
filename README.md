@@ -125,7 +125,7 @@ You need a Linux server with Python 3.11+ and ffmpeg. A $6/month VPS is plenty f
 radioshift is free and open source. If it's useful to you:
 
 - ⭐ Star the repo
-- ☕ [Buy me a coffee](https://buymeacoffee.com/PLACEHOLDER)
+- ☕ [Buy me a coffee](https://buymeacoffee.com/adamoren)
 - [GitHub Sponsors](https://github.com/sponsors/adamoren)
 
 ## License
