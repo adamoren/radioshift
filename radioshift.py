@@ -189,7 +189,7 @@ def clean_old_chunks():
 
 _NEWS_SILENCE_DB   = -35.0  # dB — transition dip that marks news start
 _NEWS_START_WINDOW = 20     # seconds — silence must appear within this window
-_NEWS_SCAN_MAX     = 900    # seconds — scan up to this far to find music return
+_NEWS_SCAN_MAX     = 3600   # seconds — scan full chunk (runs at ~10x so ~6 min/chunk)
 _NEWS_MUSIC_DB     = -20.0  # dB — RMS threshold for "music resumed"
 _NEWS_MUSIC_RUN    = 8      # consecutive seconds above threshold = music
 
