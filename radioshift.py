@@ -23,6 +23,8 @@ import datetime
 import urllib.request
 from pathlib import Path
 from typing import Optional
+import json as _json
+import socketserver
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 try:
@@ -70,14 +72,53 @@ def PID_FILE()     -> Path:  return CACHE_DIR() / "daemon.pid"
 def LOG_FILE()     -> Path:  return CACHE_DIR() / "daemon.log"
 def HTTP_PORT()    -> int:   return int(server_cfg().get("port", 8765))
 def MAX_AGE_H()    -> int:   return int(server_cfg().get("max_age_hours", 13))
+def STREAM_LAG_S() -> int:   return int(server_cfg().get("stream_lag_seconds", 0))
 def STREAM_URL()   -> str:   return station()["stream_url"]
 def SOURCE_TZ()    -> str:   return station()["source_timezone"]
 def BITRATE_KBPS() -> int:   return int(station().get("bitrate_kbps", 128))
 def BYTES_PER_SEC()-> int:   return BITRATE_KBPS() * 1000 // 8
 def ACCENT()       -> str:   return station().get("accent_color", "#0077cc")
-def SKIP_NEWS()    -> bool:  return bool(station().get("skip_news", False))
+def SKIP_NEWS()          -> bool: return bool(station().get("skip_news", False))
+def NEWS_WINDOW_START()  -> int:  return int(server_cfg().get("news_window_start_s", _NEWS_WINDOW_START))
+def NEWS_WINDOW_END()    -> int:  return int(server_cfg().get("news_window_end_s",   _NEWS_WINDOW_END))
 
 _active_ffmpeg: Optional[subprocess.Popen] = None
+
+_recognition_cache: dict = {}
+_recognition_lock  = threading.Lock()
+_RECOGNIZE_PY = Path(__file__).resolve().parent / "recognize.py"
+
+def recognize_track(chunk: Path, seek_sec: int) -> dict:
+    cache_key = (str(chunk.name), seek_sec // 60)
+    with _recognition_lock:
+        cached = _recognition_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-ss", str(seek_sec), "-i", str(chunk),
+             "-t", "10", "-ar", "44100", "-ac", "1", "-f", "mp3", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        audio, _ = ffmpeg.communicate(timeout=15)
+        if not audio:
+            return {"status": "error"}
+
+        proc = subprocess.run(
+            ["python3.11", str(_RECOGNIZE_PY)],
+            input=audio, capture_output=True, timeout=20,
+        )
+        result = _json.loads(proc.stdout) if proc.stdout else {"status": "error"}
+    except Exception as e:
+        result = {"status": "error", "reason": str(e)}
+
+    with _recognition_lock:
+        _recognition_cache[cache_key] = result
+        if len(_recognition_cache) > 500:
+            for k in list(_recognition_cache)[:100]:
+                del _recognition_cache[k]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +148,8 @@ def chunk_path(dt: datetime.datetime) -> Path:
 
 def parse_chunk_dt(path: Path) -> Optional[datetime.datetime]:
     try:
-        parts = path.stem.split("_")   # chunk_YYYYMMDD_HHMM
+        stem = path.stem.replace(".mod", "")
+        parts = stem.split("_")   # chunk_YYYYMMDD_HHMM
         return datetime.datetime.strptime(f"{parts[1]}_{parts[2]}", "%Y%m%d_%H%M")
     except (ValueError, IndexError):
         return None
@@ -150,7 +192,7 @@ def valid_chunks() -> list:
     """Return chunks that contain meaningful audio, sorted oldest first."""
     return [
         f for f in sorted(CACHE_DIR().glob("chunk_*.mp3"))
-        if f.stat().st_size >= MIN_CHUNK_BYTES
+        if f.stat().st_size >= MIN_CHUNK_BYTES and ".mod" not in f.stem
     ]
 
 
@@ -185,11 +227,17 @@ def clean_old_chunks():
 # News detection
 # ---------------------------------------------------------------------------
 
-_NEWS_SILENCE_DB   = -35.0  # dB — transition dip that marks news start
-_NEWS_START_WINDOW = 20     # seconds — silence must appear within this window
+_NEWS_SILENCE_DB   = -45.0  # dB — sustained quiet that marks news start (songs dip to ~-35)
+_NEWS_SILENCE_RUN  = 2      # consecutive seconds below threshold required (avoids song dips)
+_NEWS_MAX_DUR      = 600    # seconds — cap; longer "segments" are music not news
+_NEWS_END_DB       = -55.0  # dB — deep silence that may signal program transition
+_NEWS_END_LOUD_N   = 3      # of next 8 seconds must be above _NEWS_MUSIC_DB to confirm transition
 _NEWS_SCAN_MAX     = 3600   # seconds — scan full chunk (runs at ~10x so ~6 min/chunk)
+_NEWS_WINDOW_START = 240    # seconds into chunk where news can begin (:54 past :50 start)
+_NEWS_WINDOW_END   = 1020   # seconds into chunk where news must have started by (:07 past hour)
 _NEWS_MUSIC_DB     = -20.0  # dB — RMS threshold for "music resumed"
 _NEWS_MUSIC_RUN    = 8      # consecutive seconds above threshold = music
+_NEWS_MUSIC_MEAN_DB = -19.0 # dB — 30-sec sliding mean above this = "music" (fallback start search)
 
 
 def _rms_per_second(path: Path, duration: int) -> list:
@@ -244,27 +292,72 @@ def _find_news_segments(levels: list) -> list:
     i = 0
     n = len(levels)
     while i < n:
-        # Look for silence dip (news jingle transition)
-        if levels[i] < _NEWS_SILENCE_DB:
-            seg_start = max(0, i - 2)  # back up a couple seconds to include jingle onset
-            # Find where music returns
+        # Only trigger within the news window
+        if i < NEWS_WINDOW_START() or i > NEWS_WINDOW_END():
+            i += 1
+            continue
+        # Require sustained silence (not a single quiet song moment)
+        if all(i + k < n and levels[i + k] < _NEWS_SILENCE_DB for k in range(_NEWS_SILENCE_RUN)):
+            seg_start = max(0, i - 2)
+            # Find where news ends — two triggers, whichever comes first:
+            # 1. Program-transition: deep silence + immediate loud burst (jingle)
+            # 2. Fallback: sustained loud music
             run = 0
-            j = i + 1
+            j = i + _NEWS_SILENCE_RUN
+            seg_end = None
             while j < n:
+                # Trigger 1: deep silence followed by loud jingle
+                if levels[j] < _NEWS_END_DB:
+                    loud = sum(1 for k in range(1, 9) if j + k < n and levels[j + k] > _NEWS_MUSIC_DB)
+                    if loud >= _NEWS_END_LOUD_N:
+                        seg_end = j
+                        break
+                # Trigger 2: sustained music
                 if levels[j] > _NEWS_MUSIC_DB:
                     run += 1
                     if run >= _NEWS_MUSIC_RUN:
                         seg_end = j - _NEWS_MUSIC_RUN + 1
-                        if seg_end > seg_start + 30:  # ignore very short blips
-                            segments.append((seg_start, seg_end))
-                        i = seg_end
                         break
                 else:
                     run = 0
                 j += 1
+            if seg_end is not None:
+                dur = seg_end - seg_start
+                if 30 < dur <= _NEWS_MAX_DUR:
+                    segments.append((seg_start, seg_end))
+                i = seg_end
             else:
-                break  # silence never recovered — stop scanning
+                break
         i += 1
+
+    # Fallback: if primary found nothing, locate the end trigger and search backward
+    # using a 30-sec sliding mean to find where music faded into news (no onset silence).
+    if not segments:
+        window_start = NEWS_WINDOW_START()
+        window_end   = NEWS_WINDOW_END()
+        end_j = None
+        j = window_start
+        while j < min(n, window_end + 120):
+            if levels[j] < _NEWS_END_DB:
+                loud = sum(1 for k in range(1, 9) if j + k < n and levels[j + k] > _NEWS_MUSIC_DB)
+                if loud >= _NEWS_END_LOUD_N:
+                    end_j = j
+                    break
+            j += 1
+        if end_j is not None:
+            W = 30  # sliding-mean window size in seconds
+            seg_start = window_start
+            lo = max(window_start - 1, end_j - _NEWS_MAX_DUR - 1)
+            for i in range(end_j - W, lo, -1):
+                if i + W <= n:
+                    mean_db = sum(levels[i:i + W]) / W
+                    if mean_db > _NEWS_MUSIC_MEAN_DB:
+                        seg_start = i + W
+                        break
+            dur = end_j - seg_start
+            if 30 < dur <= _NEWS_MAX_DUR:
+                segments.append((seg_start, end_j))
+
     return segments
 
 
@@ -361,8 +454,6 @@ def is_running(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 # HTML generation
 # ---------------------------------------------------------------------------
-
-import json as _json
 
 def _js_routes() -> str:
     """JSON map of slug → IANA name, for client-side timezone detection."""
@@ -589,6 +680,39 @@ def _player_js() -> str:
 </script>"""
 
 
+def _nowplaying_js(tz: str) -> str:
+    return f"""<script>
+(function(){{
+  var box     = document.getElementById('nowplaying');
+  var title   = document.getElementById('np-title');
+  var artist  = document.getElementById('np-artist');
+  var cover   = document.getElementById('np-cover');
+  var spinner = document.getElementById('np-spinner');
+  var slug    = '{tz}';
+
+  function poll() {{
+    fetch('/nowplaying/' + slug)
+      .then(function(r) {{ return r.json(); }})
+      .then(function(d) {{
+        if (d.status === 'ok' && d.title) {{
+          title.textContent  = d.title;
+          artist.textContent = d.artist || '';
+          if (d.cover) {{ cover.src = d.cover; cover.style.display = 'block'; }}
+          else          {{ cover.style.display = 'none'; }}
+          spinner.style.display = 'none';
+          box.style.display = 'flex';
+        }} else {{
+          box.style.display = 'none';
+        }}
+      }})
+      .catch(function() {{}});
+    setTimeout(poll, 30000);
+  }}
+  poll();
+}})();
+</script>"""
+
+
 def _tz_tabs(active_tz: str) -> str:
     tabs = ""
     for label, iana in tz_routes().items():
@@ -674,6 +798,20 @@ def html_player(tz: str, iana: str, delay: float,
       animation: pulse 1.6s ease-in-out infinite;
     }}
     @keyframes pulse {{ 0%,100%{{ opacity:1 }} 50%{{ opacity:.25 }} }}
+    .nowplaying {{
+      display: none; align-items: center; gap: 12px;
+      background: #111; border-radius: 12px; padding: 12px 14px;
+      margin-bottom: 16px; min-height: 56px;
+    }}
+    .np-cover {{
+      width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex-shrink: 0;
+      background: #222; display: none;
+    }}
+    .np-text {{ flex: 1; overflow: hidden; }}
+    .np-title {{ font-size: 13px; font-weight: 600; color: #f0f0f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .np-artist {{ font-size: 11px; color: #666; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .np-spinner {{ width: 18px; height: 18px; border: 2px solid #333; border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; flex-shrink: 0; }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     .controls {{ display: flex; gap: 8px; margin-bottom: 16px; }}
     .ctrl-btn {{
       flex: 1; display: flex; align-items: center; justify-content: center;
@@ -768,6 +906,15 @@ def html_player(tz: str, iana: str, delay: float,
 
     <audio autoplay src="/stream/{tz}" id="player"></audio>
 
+    <div class="nowplaying" id="nowplaying">
+      <img class="np-cover" id="np-cover" src="" alt="">
+      <div class="np-text">
+        <div class="np-title" id="np-title">Identifying song…</div>
+        <div class="np-artist" id="np-artist"></div>
+      </div>
+      <div class="np-spinner" id="np-spinner"></div>
+    </div>
+
     <div class="controls">
       <button class="ctrl-btn" id="mute-btn">
         <span id="mute-icon">🔇</span>
@@ -830,6 +977,7 @@ def html_player(tz: str, iana: str, delay: float,
 {_tz_suggest_js(tz)}
 {_clock_js(SOURCE_TZ(), iana, target_ms)}
 {_player_js()}
+{_nowplaying_js(tz)}
 </body>
 </html>"""
 
@@ -1058,6 +1206,15 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
 
+        if path.startswith("/nowplaying/"):
+            slug = path[len("/nowplaying/"):]
+            iana = tz_routes().get(slug.upper())
+            if iana:
+                self._serve_nowplaying(slug, iana)
+            else:
+                self._text(404, "Unknown timezone.\n")
+            return
+
         if path.startswith("/stream/"):
             slug = path[len("/stream/"):]
             if slug == "live":
@@ -1118,7 +1275,7 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
     def _serve_stream(self, tz: str, iana: str):
         delay = delay_hours_for_tz(iana)
         now = utcnow()
-        target_dt = now - datetime.timedelta(hours=delay)
+        target_dt = now - datetime.timedelta(hours=delay) + datetime.timedelta(seconds=STREAM_LAG_S())
         target_chunk = chunk_path(target_dt)
 
         if not target_chunk.exists():
@@ -1159,7 +1316,12 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
                 dt = parse_chunk_dt(current)
                 if dt is None:
                     break
-                current = chunk_path(dt + datetime.timedelta(hours=1))
+                next_chunk = chunk_path(dt + datetime.timedelta(hours=1))
+                if skip_requested or SKIP_NEWS():
+                    next_mc = mod_chunk(next_chunk)
+                    current = next_mc if next_mc.exists() else next_chunk
+                else:
+                    current = next_chunk
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
@@ -1208,6 +1370,27 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _serve_nowplaying(self, tz: str, iana: str):
+        delay = delay_hours_for_tz(iana)
+        now = utcnow()
+        target_dt = now - datetime.timedelta(hours=delay) + datetime.timedelta(seconds=STREAM_LAG_S())
+        target_chunk = chunk_path(target_dt)
+        if not target_chunk.exists():
+            self._serve_json(200, {"status": "not_ready"})
+            return
+        seek_sec = int((target_dt - chunk_floor(target_dt)).total_seconds())
+        result = recognize_track(target_chunk, seek_sec)
+        self._serve_json(200, result)
+
+    def _serve_json(self, code: int, data: dict):
+        b = _json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
     def _html(self, code: int, body: str):
         b = body.encode("utf-8")
         self.send_response(code)
@@ -1225,8 +1408,11 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
 
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 def run_http_server():
-    server = HTTPServer(("127.0.0.1", HTTP_PORT()), TimeshiftHandler)
+    server = _ThreadingHTTPServer(("127.0.0.1", HTTP_PORT()), TimeshiftHandler)
     log(f"HTTP server on 127.0.0.1:{HTTP_PORT()}")
     server.serve_forever()
 
@@ -1241,11 +1427,23 @@ def recording_loop():
     log(f"Recording {STREAM_URL()}")
     clean_old_chunks()
 
+    prev_out: Optional[Path] = None
+
     while True:
         now = utcnow()
         next_hour = chunk_floor(now) + datetime.timedelta(hours=1)
         duration = max(1, int((next_hour - now).total_seconds()))
         out = chunk_path(now)
+
+        # If we crossed a boundary (e.g. due to CDN crash retries), scan the
+        # previous chunk now — it won't get another chance.
+        if prev_out and prev_out != out and prev_out.exists() and FILL_TRACK.exists():
+            if not mod_chunk(prev_out).exists():
+                threading.Thread(
+                    target=detect_and_save_news_skip,
+                    args=(prev_out,), daemon=True,
+                ).start()
+        prev_out = out
 
         # Drop sub-1MB stubs from previous interrupted starts
         if out.exists() and out.stat().st_size < MIN_CHUNK_BYTES:
@@ -1324,11 +1522,27 @@ def daemonize():
     PID_FILE().write_text(str(os.getpid()))
 
 
+def _scan_missing_mod_files():
+    """On startup, kick off detection for completed chunks that have no mod file yet."""
+    if not FILL_TRACK.exists():
+        return
+    current = chunk_path(utcnow())
+    for chunk in valid_chunks():
+        if chunk == current:
+            continue  # still recording, skip
+        if not mod_chunk(chunk).exists():
+            log(f"Startup scan: queuing {chunk.name} for news detection")
+            threading.Thread(
+                target=detect_and_save_news_skip, args=(chunk,), daemon=True,
+            ).start()
+
+
 def daemon_main():
     signal.signal(signal.SIGTERM, _sigterm)
     CACHE_DIR().mkdir(parents=True, exist_ok=True)
     log(f"Daemon started (PID {os.getpid()})")
     threading.Thread(target=run_http_server, daemon=True).start()
+    threading.Thread(target=_scan_missing_mod_files, daemon=True).start()
     recording_loop()
 
 
