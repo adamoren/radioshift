@@ -68,6 +68,8 @@ python radioshift.py [--config config.toml] status  # show buffer and stream sta
 | `/stream/<tz>.m3u` | M3U playlist — use with CarPlay / Android Auto apps |
 | `/stream/live.m3u` | M3U playlist for the live stream |
 | `/nowplaying/<tz>` | JSON — currently playing song title, artist, and cover art |
+| `/songs/<tz>` | JSON — today's played songs with liked status for each |
+| `/liked` | JSON — all liked songs |
 
 ## CarPlay and Android Auto
 
@@ -153,11 +155,18 @@ You need a Linux server with Python 3.11+ and ffmpeg. A $6/month VPS is plenty f
 
 ```
 http://radio.example.com {
-    reverse_proxy 127.0.0.1:8765 {
-        flush_interval -1
+    handle /stream/* {
+        reverse_proxy 127.0.0.1:8765 {
+            flush_interval -1
+        }
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8765
     }
 }
 ```
+
+> **Important:** `flush_interval -1` must be scoped to `/stream/*` only. Applying it globally causes other endpoints (JSON APIs, the web player) to hang when accessed through Cloudflare or some reverse proxies.
 
 ### systemd service
 
