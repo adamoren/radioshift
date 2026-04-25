@@ -2,6 +2,12 @@
 
 Time-shifted internet radio for diaspora listeners.
 
+<p align="center">
+  <img src="screenshots/player.png" width="220" alt="Player" />
+  &nbsp;&nbsp;
+  <img src="screenshots/songs.png" width="220" alt="Today's songs panel" />
+</p>
+
 Records a live radio stream and serves it with a delay so that listeners in different timezones hear the station at the **same local time of day** as listeners back home. A morning show that airs at 8 AM in Israel plays at 8 AM in New York, Chicago, Denver, and Los Angeles — each with the appropriate delay.
 
 ## How it works
