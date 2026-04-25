@@ -21,6 +21,7 @@ import threading
 import subprocess
 import datetime
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 import json as _json
@@ -88,6 +89,117 @@ _recognition_cache: dict = {}
 _recognition_lock  = threading.Lock()
 _RECOGNIZE_PY = Path(__file__).resolve().parent / "recognize.py"
 
+# ---------------------------------------------------------------------------
+# Playlist logging
+# ---------------------------------------------------------------------------
+
+_playlist_lock = threading.Lock()
+PLAYLIST_RETAIN_DAYS = 7
+
+
+def playlist_path(utc_date) -> Path:
+    return CACHE_DIR() / f"playlist_{utc_date.strftime('%Y%m%d')}.json"
+
+
+def _playlist_append(entry: dict):
+    path = playlist_path(datetime.date.fromisoformat(entry["utc"][:10]))
+    with _playlist_lock:
+        entries = []
+        if path.exists():
+            try:
+                entries = _json.loads(path.read_text())
+            except Exception:
+                entries = []
+        entries.append(entry)
+        path.write_text(_json.dumps(entries, ensure_ascii=False))
+
+
+def _load_playlist_entries(utc_start: datetime.datetime, utc_end: datetime.datetime) -> list:
+    entries = []
+    for delta in range(-1, 2):
+        check_date = (utc_start + datetime.timedelta(days=delta)).date()
+        path = playlist_path(check_date)
+        if not path.exists():
+            continue
+        try:
+            with _playlist_lock:
+                file_entries = _json.loads(path.read_text())
+            for e in file_entries:
+                utc_dt = datetime.datetime.strptime(e["utc"], "%Y-%m-%dT%H:%M:%S")
+                if utc_start <= utc_dt < utc_end:
+                    entries.append((utc_dt, e))
+        except Exception:
+            pass
+    entries.sort(key=lambda x: x[0])
+    return [e for _, e in entries]
+
+
+def clean_old_playlists():
+    cutoff = datetime.date.today() - datetime.timedelta(days=PLAYLIST_RETAIN_DAYS)
+    for f in CACHE_DIR().glob("playlist_????????.json"):
+        try:
+            ds = f.stem.replace("playlist_", "")
+            file_date = datetime.date(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
+            if file_date < cutoff:
+                f.unlink()
+        except Exception:
+            pass
+
+
+def scan_chunk_for_playlist(chunk: Path, interval_sec: int = 90):
+    """
+    Scan a completed chunk for songs and append transitions to the daily playlist.
+    Runs after chunk recording finishes — same pattern as news detection.
+    The chunk will be heard by listeners 7-10h later, so there's plenty of time.
+    """
+    chunk_dt = parse_chunk_dt(chunk)
+    if chunk_dt is None:
+        return
+
+    iana    = next(iter(tz_routes().values()))
+    delay_h = delay_hours_for_tz(iana)
+
+    chunk_size = chunk.stat().st_size
+    duration   = min(chunk_size // BYTES_PER_SEC(), 3600)
+
+    log(f"Playlist scan: {chunk.name} ({duration}s, {interval_sec}s interval)")
+
+    last_title  = None
+    last_artist = None
+
+    for seek in range(0, duration, interval_sec):
+        try:
+            result = recognize_track(chunk, seek)
+        except Exception as e:
+            log(f"Playlist scan error at {chunk.name}+{seek}s: {e}")
+            continue
+
+        if result.get("status") != "ok":
+            continue
+
+        title  = result.get("title", "")
+        artist = result.get("artist", "")
+        if not title:
+            continue
+        if title == last_title and artist == last_artist:
+            continue
+
+        last_title  = title
+        last_artist = artist
+
+        # Convert audio position to the wall-clock UTC time when listeners hear it
+        audio_utc = chunk_dt + datetime.timedelta(seconds=seek)
+        wall_utc  = audio_utc + datetime.timedelta(hours=delay_h)
+
+        entry = {
+            "utc":    wall_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+            "title":  title,
+            "artist": artist,
+            "cover":  result.get("cover", ""),
+        }
+        _playlist_append(entry)
+        log(f"Playlist: {artist} — {title}")
+
 def recognize_track(chunk: Path, seek_sec: int) -> dict:
     cache_key = (str(chunk.name), seek_sec // 60)
     with _recognition_lock:
@@ -119,6 +231,273 @@ def recognize_track(chunk: Path, seek_sec: int) -> dict:
             for k in list(_recognition_cache)[:100]:
                 del _recognition_cache[k]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Spotify integration
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_TOKENS_FILE  = Path(__file__).resolve().parent / "spotify_tokens.json"
+_SPOTIFY_PL_STATE     = Path(__file__).resolve().parent / "spotify_playlists.json"
+_spotify_token_lock   = threading.Lock()
+_spotify_pl_lock      = threading.Lock()
+_spotify_token_cache: dict = {"access_token": None, "expires_at": 0.0}
+
+_LIKED_SONGS_FILE = Path(__file__).resolve().parent / "liked_songs.json"
+_liked_lock = threading.Lock()
+
+
+def _liked_songs_read() -> list:
+    if not _LIKED_SONGS_FILE.exists():
+        return []
+    try:
+        return _json.loads(_LIKED_SONGS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _liked_songs_add(title: str, artist: str, cover: str) -> str:
+    with _liked_lock:
+        songs = _liked_songs_read()
+        for s in songs:
+            if s.get("title") == title and s.get("artist") == artist:
+                return "already_liked"
+        songs.insert(0, {
+            "title":    title,
+            "artist":   artist,
+            "cover":    cover,
+            "liked_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        _LIKED_SONGS_FILE.write_text(_json.dumps(songs, ensure_ascii=False, indent=2))
+        return "ok"
+
+
+def _liked_songs_remove(title: str, artist: str) -> str:
+    with _liked_lock:
+        songs = _liked_songs_read()
+        new = [s for s in songs if not (s.get("title") == title and s.get("artist") == artist)]
+        if len(new) == len(songs):
+            return "not_found"
+        _LIKED_SONGS_FILE.write_text(_json.dumps(new, ensure_ascii=False, indent=2))
+        return "ok"
+
+
+def spotify_cfg() -> dict:
+    return CFG.get("spotify", {})
+
+
+def _get_spotify_token() -> Optional[str]:
+    if not _SPOTIFY_TOKENS_FILE.exists():
+        return None
+    sp = spotify_cfg()
+    if not sp.get("client_id") or not sp.get("client_secret"):
+        return None
+
+    with _spotify_token_lock:
+        now = time.time()
+        if _spotify_token_cache["access_token"] and _spotify_token_cache["expires_at"] > now + 60:
+            return _spotify_token_cache["access_token"]
+        try:
+            tokens = _json.loads(_SPOTIFY_TOKENS_FILE.read_text())
+            import base64 as _b64
+            creds = _b64.b64encode(f"{sp['client_id']}:{sp['client_secret']}".encode()).decode()
+            body  = urllib.parse.urlencode({
+                "grant_type":    "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+            }).encode()
+            req = urllib.request.Request(
+                "https://accounts.spotify.com/api/token", data=body,
+                headers={"Authorization": f"Basic {creds}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = _json.loads(r.read())
+            access_token = result["access_token"]
+            if "refresh_token" in result:
+                tokens["refresh_token"] = result["refresh_token"]
+            tokens["access_token"] = access_token
+            _SPOTIFY_TOKENS_FILE.write_text(_json.dumps(tokens))
+            _spotify_token_cache["access_token"] = access_token
+            _spotify_token_cache["expires_at"]   = now + result.get("expires_in", 3600)
+            return access_token
+        except Exception as e:
+            log(f"Spotify token refresh error: {e}")
+            return None
+
+
+def _spotify_like(title: str, artist: str) -> dict:
+    token = _get_spotify_token()
+    if not token:
+        return {"status": "error", "reason": "not_authorized"}
+    try:
+        q   = urllib.parse.quote(f'track:"{title}" artist:"{artist}"')
+        req = urllib.request.Request(
+            f"https://api.spotify.com/v1/search?q={q}&type=track&limit=3&market=US",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = _json.loads(r.read())
+        items = result.get("tracks", {}).get("items", [])
+        if not items:
+            # Fallback: looser query
+            q2  = urllib.parse.quote(f"{title} {artist}")
+            req = urllib.request.Request(
+                f"https://api.spotify.com/v1/search?q={q2}&type=track&limit=3&market=US",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = _json.loads(r.read())
+            items = result.get("tracks", {}).get("items", [])
+        if not items:
+            return {"status": "error", "reason": "not_found"}
+        track_id = items[0]["id"]
+        req2 = urllib.request.Request(
+            "https://api.spotify.com/v1/me/tracks",
+            data=_json.dumps({"ids": [track_id]}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req2, timeout=10):
+            pass
+        return {"status": "ok", "track": items[0]["name"]}
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+def _spotify_search_uri(token: str, title: str, artist: str) -> Optional[str]:
+    for q in [
+        urllib.parse.quote(f'track:"{title}" artist:"{artist}"'),
+        urllib.parse.quote(f"{title} {artist}"),
+    ]:
+        try:
+            req = urllib.request.Request(
+                f"https://api.spotify.com/v1/search?q={q}&type=track&limit=1&market=US",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                items = _json.loads(r.read()).get("tracks", {}).get("items", [])
+            if items:
+                return items[0]["uri"]
+        except Exception:
+            pass
+    return None
+
+
+def _spotify_pl_state() -> dict:
+    if _SPOTIFY_PL_STATE.exists():
+        try:
+            return _json.loads(_SPOTIFY_PL_STATE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _spotify_pl_state_save(state: dict):
+    _SPOTIFY_PL_STATE.write_text(_json.dumps(state, indent=2))
+
+
+def _spotify_get_day_playlist(token: str, day_name: str) -> Optional[str]:
+    """Return playlist ID for the given weekday, creating it if needed."""
+    with _spotify_pl_lock:
+        pl_id = _spotify_pl_state().get(day_name, {}).get("id", "")
+    if pl_id:
+        return pl_id
+
+    station_name  = station().get("name", "Radio")
+    playlist_name = f"{station_name} — {day_name}"
+    try:
+        req = urllib.request.Request(
+            "https://api.spotify.com/v1/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            user_id = _json.loads(r.read())["id"]
+
+        offset = 0
+        while True:
+            req = urllib.request.Request(
+                f"https://api.spotify.com/v1/me/playlists?limit=50&offset={offset}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = _json.loads(r.read())
+            for pl in result.get("items", []):
+                if pl and pl.get("name") == playlist_name:
+                    pl_id = pl["id"]
+                    with _spotify_pl_lock:
+                        state = _spotify_pl_state()
+                        state.setdefault(day_name, {})["id"] = pl_id
+                        _spotify_pl_state_save(state)
+                    return pl_id
+            if not result.get("next"):
+                break
+            offset += 50
+
+        req = urllib.request.Request(
+            "https://api.spotify.com/v1/me/playlists",
+            data=_json.dumps({
+                "name": playlist_name, "public": False,
+                "description": f"Auto-generated by radioshift — {day_name} programming",
+            }).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            pl_id = _json.loads(r.read())["id"]
+        with _spotify_pl_lock:
+            state = _spotify_pl_state()
+            state.setdefault(day_name, {})["id"] = pl_id
+            _spotify_pl_state_save(state)
+        log(f"Spotify: created playlist '{playlist_name}'")
+        return pl_id
+    except Exception as e:
+        log(f"Spotify: error getting/creating {day_name} playlist: {e}")
+        return None
+
+
+def _spotify_add_to_playlist(entry: dict):
+    """Add a detected song to the weekday Spotify playlist. PUT-replaces on weekly rollover."""
+    token = _get_spotify_token()
+    if not token:
+        return
+
+    wall_utc   = datetime.datetime.strptime(entry["utc"], "%Y-%m-%dT%H:%M:%S")
+    iana       = next(iter(tz_routes().values()))
+    local_dt   = wall_utc.replace(tzinfo=datetime.timezone.utc).astimezone(ZoneInfo(iana))
+    day_name   = local_dt.strftime("%A")
+    local_date = local_dt.date().isoformat()
+
+    pl_id = _spotify_get_day_playlist(token, day_name)
+    if not pl_id:
+        return
+
+    with _spotify_pl_lock:
+        stored_date = _spotify_pl_state().get(day_name, {}).get("date", "")
+    is_new_week = stored_date != local_date
+
+    uri = _spotify_search_uri(token, entry["title"], entry["artist"])
+    if not uri:
+        log(f"Spotify {day_name}: not found — {entry['artist']} — {entry['title']}")
+        return
+
+    try:
+        method = "PUT" if is_new_week else "POST"
+        req = urllib.request.Request(
+            f"https://api.spotify.com/v1/playlists/{pl_id}/tracks",
+            data=_json.dumps({"uris": [uri]}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        with _spotify_pl_lock:
+            state = _spotify_pl_state()
+            state.setdefault(day_name, {})["date"] = local_date
+            _spotify_pl_state_save(state)
+        action = "reset →" if is_new_week else "+"
+        log(f"Spotify {day_name}: {action} {entry['artist']} — {entry['title']}")
+    except Exception as e:
+        log(f"Spotify {day_name} error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +607,7 @@ def clean_old_chunks():
 # ---------------------------------------------------------------------------
 
 _NEWS_SILENCE_DB   = -45.0  # dB — sustained quiet that marks news start (songs dip to ~-35)
-_NEWS_SILENCE_RUN  = 2      # consecutive seconds below threshold required (avoids song dips)
+_NEWS_SILENCE_RUN  = 5      # consecutive seconds below threshold required (avoids song dips)
 _NEWS_MAX_DUR      = 600    # seconds — cap; longer "segments" are music not news
 _NEWS_END_DB       = -55.0  # dB — deep silence that may signal program transition
 _NEWS_END_LOUD_N   = 3      # of next 8 seconds must be above _NEWS_MUSIC_DB to confirm transition
@@ -323,7 +702,7 @@ def _find_news_segments(levels: list) -> list:
                 j += 1
             if seg_end is not None:
                 dur = seg_end - seg_start
-                if 30 < dur <= _NEWS_MAX_DUR:
+                if 120 < dur <= _NEWS_MAX_DUR:
                     segments.append((seg_start, seg_end))
                 i = seg_end
             else:
@@ -331,6 +710,7 @@ def _find_news_segments(levels: list) -> list:
         i += 1
 
     # Fallback: if primary found nothing, locate the end trigger and search backward
+
     # using a 30-sec sliding mean to find where music faded into news (no onset silence).
     if not segments:
         window_start = NEWS_WINDOW_START()
@@ -355,7 +735,7 @@ def _find_news_segments(levels: list) -> list:
                         seg_start = i + W
                         break
             dur = end_j - seg_start
-            if 30 < dur <= _NEWS_MAX_DUR:
+            if 120 < dur <= _NEWS_MAX_DUR:
                 segments.append((seg_start, end_j))
 
     return segments
@@ -680,29 +1060,175 @@ def _player_js() -> str:
 </script>"""
 
 
+def _spotify_js() -> str:
+    """Like-button helper — saves songs locally via /like."""
+    return """<script>
+(function() {
+  window.spotifyLike = function(title, artist, btn) {
+    if (!title) return;
+    var cover = document.getElementById('np-cover');
+    var coverSrc = (cover && cover.style.display !== 'none') ? cover.src : '';
+    var liked = btn && btn.textContent === '♥';
+    if (liked) {
+      fetch('/unlike', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({title:title, artist:artist})})
+      .then(function() {
+        if (btn) { btn.textContent = '♡'; btn.style.color = ''; }
+      }).catch(function() {});
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
+    fetch('/like', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({title:title, artist:artist, cover:coverSrc})})
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.status === 'ok' || d.status === 'already_liked') {
+        if (btn) { btn.textContent = '♥'; btn.style.color = '#e05'; btn.disabled = false; }
+      } else {
+        if (btn) { btn.textContent = '♡'; btn.style.color = ''; btn.disabled = false; }
+      }
+    })
+    .catch(function() {
+      if (btn) { btn.textContent = '♡'; btn.style.color = ''; btn.disabled = false; }
+    });
+  };
+})();
+</script>"""
+
+
+_SPOTIFY_OAUTH_STATE_FILE = Path(__file__).resolve().parent / "spotify_oauth_state.json"
+
+
+def _spotify_start_auth(return_path: str = "/") -> str:
+    """Generate OAuth state, save it, return Spotify authorize URL."""
+    import secrets as _secrets
+    sp    = spotify_cfg()
+    state = _secrets.token_urlsafe(24)
+    _SPOTIFY_OAUTH_STATE_FILE.write_text(_json.dumps({"state": state, "return": return_path}))
+    params = urllib.parse.urlencode({
+        "client_id":     sp["client_id"],
+        "response_type": "code",
+        "redirect_uri":  sp["redirect_uri"],
+        "scope":         "user-library-modify playlist-read-private playlist-modify-public playlist-modify-private",
+        "state":         state,
+        "show_dialog":   "true",
+    })
+    return f"https://accounts.spotify.com/authorize?{params}"
+
+
+def _spotify_finish_auth(code: str, state: str) -> str:
+    """Exchange code for tokens server-side, save them, return redirect path."""
+    try:
+        saved = _json.loads(_SPOTIFY_OAUTH_STATE_FILE.read_text())
+    except Exception:
+        saved = {}
+    return_path = saved.get("return", "/")
+    if saved.get("state") != state:
+        return "/?spotify_error=state_mismatch"
+    try:
+        _SPOTIFY_OAUTH_STATE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    sp = spotify_cfg()
+    import base64 as _b64
+    creds = _b64.b64encode(f"{sp['client_id']}:{sp['client_secret']}".encode()).decode()
+    body  = urllib.parse.urlencode({
+        "grant_type":   "authorization_code",
+        "code":         code,
+        "redirect_uri": sp["redirect_uri"],
+    }).encode()
+    req = urllib.request.Request(
+        "https://accounts.spotify.com/api/token", data=body,
+        headers={"Authorization": f"Basic {creds}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = _json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        log(f"Spotify auth error: {err}")
+        return f"/?spotify_error={urllib.parse.quote(err[:80])}"
+
+    _SPOTIFY_TOKENS_FILE.write_text(_json.dumps({
+        "access_token":  result["access_token"],
+        "refresh_token": result["refresh_token"],
+    }, indent=2))
+    with _spotify_token_lock:
+        _spotify_token_cache["access_token"] = result["access_token"]
+        _spotify_token_cache["expires_at"]   = time.time() + result.get("expires_in", 3600)
+    log("Spotify: authorized and tokens saved.")
+    return return_path
+
+
 def _nowplaying_js(tz: str) -> str:
     return f"""<script>
 (function(){{
-  var box     = document.getElementById('nowplaying');
-  var title   = document.getElementById('np-title');
-  var artist  = document.getElementById('np-artist');
-  var cover   = document.getElementById('np-cover');
-  var spinner = document.getElementById('np-spinner');
-  var slug    = '{tz}';
+  var box      = document.getElementById('nowplaying');
+  var title    = document.getElementById('np-title');
+  var artist   = document.getElementById('np-artist');
+  var cover    = document.getElementById('np-cover');
+  var spinner  = document.getElementById('np-spinner');
+  var likeBtn  = document.getElementById('np-like');
+  var muteBtn  = document.getElementById('np-mute-song');
+  var audio    = document.getElementById('player');
+  var slug     = '{tz}';
+  var currentSong = {{title: '', artist: ''}};
+  var songMuted = false;
+  var songMuteTimer = null;
+  var everDetected = false;
+  var failCount = 0;
+  var MAX_FAILS = 5;
+
+  function unmuteSong() {{
+    if (songMuteTimer) {{ clearTimeout(songMuteTimer); songMuteTimer = null; }}
+    songMuted = false;
+    audio.muted = localStorage.getItem('muted') === '1';
+    if (muteBtn) {{ muteBtn.classList.remove('active'); muteBtn.textContent = 'Mute song'; }}
+  }}
+
+  window.muteSong = function() {{
+    if (songMuted) {{ unmuteSong(); return; }}
+    songMuted = true;
+    audio.muted = true;
+    if (muteBtn) {{ muteBtn.classList.add('active'); muteBtn.textContent = 'Muted'; }}
+    songMuteTimer = setTimeout(unmuteSong, 300000);
+  }};
+
+  window.likeCurrentSong = function() {{
+    if (!currentSong.title || !window.spotifyLike) return;
+    window.spotifyLike(currentSong.title, currentSong.artist, likeBtn);
+  }};
 
   function poll() {{
     fetch('/nowplaying/' + slug)
       .then(function(r) {{ return r.json(); }})
       .then(function(d) {{
         if (d.status === 'ok' && d.title) {{
+          failCount = 0;
+          if (d.title !== currentSong.title || d.artist !== currentSong.artist) {{
+            currentSong = {{title: d.title, artist: d.artist || ''}};
+            likeBtn.textContent = '♡';
+            likeBtn.style.color = '';
+            likeBtn.disabled = false;
+            if (songMuted) unmuteSong();
+          }}
           title.textContent  = d.title;
           artist.textContent = d.artist || '';
           if (d.cover) {{ cover.src = d.cover; cover.style.display = 'block'; }}
           else          {{ cover.style.display = 'none'; }}
           spinner.style.display = 'none';
+          likeBtn.style.display = 'block';
+          muteBtn.style.display = 'block';
           box.style.display = 'flex';
+          everDetected = true;
         }} else {{
-          box.style.display = 'none';
+          failCount++;
+          if (!everDetected || failCount >= MAX_FAILS) {{
+            if (songMuted) unmuteSong();
+            box.style.display = 'none';
+          }}
         }}
       }})
       .catch(function() {{}});
@@ -811,6 +1337,11 @@ def html_player(tz: str, iana: str, delay: float,
     .np-title {{ font-size: 13px; font-weight: 600; color: #f0f0f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .np-artist {{ font-size: 11px; color: #666; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .np-spinner {{ width: 18px; height: 18px; border: 2px solid #333; border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; flex-shrink: 0; }}
+    .np-like {{ background: none; border: none; color: #444; font-size: 20px; cursor: pointer; padding: 0 2px; flex-shrink: 0; line-height: 1; display: none; }}
+    .np-like:hover {{ color: #1DB954; }}
+    .np-mute-song {{ background: none; border: none; color: #444; font-size: 12px; font-weight: 600; cursor: pointer; padding: 3px 7px; flex-shrink: 0; line-height: 1; display: none; border-radius: 6px; font-family: inherit; }}
+    .np-mute-song:hover {{ color: #ccc; background: #222; }}
+    .np-mute-song.active {{ color: #fff; background: #333; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     .controls {{ display: flex; gap: 8px; margin-bottom: 16px; }}
     .ctrl-btn {{
@@ -884,6 +1415,49 @@ def html_player(tz: str, iana: str, delay: float,
       color: #888; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
     }}
     .car-close:hover {{ background: #2a2a2a; color: #fff; }}
+    .liked-modal {{
+      display: none; position: fixed; inset: 0; z-index: 100;
+      align-items: flex-end; justify-content: center;
+      background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+    }}
+    .liked-modal.open {{ display: flex; }}
+    .liked-sheet {{
+      background: #1a1a1a; border-radius: 20px 20px 0 0;
+      width: min(460px, 100vw); padding: 24px 24px 32px;
+      border-top: 1px solid #2a2a2a; max-height: 80dvh;
+      display: flex; flex-direction: column;
+    }}
+    .liked-head {{
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 16px; flex-shrink: 0;
+    }}
+    .liked-head h3 {{ font-size: 16px; font-weight: 700; color: #f0f0f0; }}
+    .liked-x {{
+      background: #2a2a2a; border: none; border-radius: 50%; width: 28px; height: 28px;
+      color: #888; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    }}
+    .liked-x:hover {{ background: #333; color: #fff; }}
+    .liked-entries {{ overflow-y: auto; flex: 1; }}
+    .liked-entry {{
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 2px; border-bottom: 1px solid #222;
+    }}
+    .liked-entry:last-child {{ border-bottom: none; }}
+    .liked-cover {{
+      width: 40px; height: 40px; border-radius: 7px; object-fit: cover;
+      background: #222; flex-shrink: 0;
+    }}
+    .liked-cover-ph {{
+      width: 40px; height: 40px; border-radius: 7px; background: #222; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 16px; color: #444;
+    }}
+    .liked-text {{ flex: 1; overflow: hidden; }}
+    .liked-title {{ font-size: 13px; font-weight: 600; color: #f0f0f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .liked-artist {{ font-size: 11px; color: #666; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .liked-time {{ font-size: 11px; color: #555; flex-shrink: 0; font-variant-numeric: tabular-nums; }}
+    .liked-rm {{ background: none; border: none; color: #333; font-size: 16px; cursor: pointer; padding: 4px 5px; flex-shrink: 0; line-height: 1; border-radius: 5px; }}
+    .liked-rm:hover {{ color: #888; background: #222; }}
+    .liked-empty {{ text-align: center; color: #444; font-size: 14px; padding: 32px 0; }}
   </style>
 </head>
 <body>
@@ -913,6 +1487,8 @@ def html_player(tz: str, iana: str, delay: float,
         <div class="np-artist" id="np-artist"></div>
       </div>
       <div class="np-spinner" id="np-spinner"></div>
+      <button class="np-mute-song" id="np-mute-song" onclick="muteSong()" title="Mute until next song">Mute song</button>
+      <button class="np-like" id="np-like" onclick="likeCurrentSong()" title="Save to Liked Songs">♡</button>
     </div>
 
     <div class="controls">
@@ -930,9 +1506,10 @@ def html_player(tz: str, iana: str, delay: float,
       {tabs}
     </div>
 
-    <button class="car-trigger" onclick="document.getElementById('car-modal').classList.add('open')">
-      &#128664; How to play in your car
-    </button>
+    <div style="display:flex;gap:8px;margin-top:14px;">
+      <button style="flex:1;" class="car-trigger" id="liked-btn" onclick="openSongs()">&#9835; Songs</button>
+      <button style="flex:1;" class="car-trigger" onclick="document.getElementById('car-modal').classList.add('open')">&#128664; In your car</button>
+    </div>
   </div>
 
   <div class="car-modal" id="car-modal" onclick="if(event.target===this)this.classList.remove('open')">
@@ -974,10 +1551,91 @@ def html_player(tz: str, iana: str, delay: float,
       <button class="car-close" onclick="document.getElementById('car-modal').classList.remove('open')">Close</button>
     </div>
   </div>
+
+  <div class="liked-modal" id="liked-modal" onclick="if(event.target===this)this.classList.remove('open')">
+    <div class="liked-sheet">
+      <div class="liked-head">
+        <h3>&#9835; Today's Songs</h3>
+        <button class="liked-x" onclick="document.getElementById('liked-modal').classList.remove('open')">&times;</button>
+      </div>
+      <div class="liked-entries" id="liked-entries"></div>
+    </div>
+  </div>
 {_tz_suggest_js(tz)}
 {_clock_js(SOURCE_TZ(), iana, target_ms)}
 {_player_js()}
 {_nowplaying_js(tz)}
+{_spotify_js()}
+<script>
+(function() {{
+  var TZ = '{tz}';
+  function esc(s) {{ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }}
+
+  function renderSongs(songs) {{
+    var el = document.getElementById('liked-entries');
+    if (!songs || !songs.length) {{
+      el.innerHTML = '<div class="liked-empty">No songs logged yet today.</div>';
+      return;
+    }}
+    var html = '';
+    songs.forEach(function(s) {{
+      var cover = s.cover
+        ? '<img class="liked-cover" src="' + esc(s.cover) + '" alt="">'
+        : '<div class="liked-cover-ph">&#9835;</div>';
+      var heart = s.liked ? '&#9829;' : '&#9825;';
+      var hcol  = s.liked ? '#e05' : '#444';
+      html += '<div class="liked-entry" data-title="' + esc(s.title) + '" data-artist="' + esc(s.artist) + '">' +
+        cover +
+        '<div class="liked-text"><div class="liked-title">' + esc(s.title) + '</div>' +
+        '<div class="liked-artist">' + esc(s.artist) + '</div></div>' +
+        '<div class="liked-time">' + esc(s.time||'') + '</div>' +
+        '<button class="liked-rm" style="color:' + hcol + ';font-size:18px;" title="Like" ' +
+          'onclick="toggleLike(this)">'+heart+'</button>' +
+        '</div>';
+    }});
+    el.innerHTML = html;
+  }}
+
+  window.openSongs = function() {{
+    document.getElementById('liked-modal').classList.add('open');
+    document.getElementById('liked-entries').innerHTML = '<div class="liked-empty">Loading…</div>';
+    fetch('/songs/' + TZ).then(function(r) {{ return r.json(); }})
+      .then(function(d) {{ renderSongs(d.songs || []); }})
+      .catch(function() {{
+        document.getElementById('liked-entries').innerHTML = '<div class="liked-empty">Could not load.</div>';
+      }});
+  }};
+
+  window.toggleLike = function(btn) {{
+    var entry  = btn.closest('.liked-entry');
+    var title  = entry.dataset.title;
+    var artist = entry.dataset.artist;
+    var liked  = btn.innerHTML === '&#9829;' || btn.textContent === '♥';
+    var url    = liked ? '/unlike' : '/like';
+    var cover  = entry.querySelector('img');
+    var coverSrc = cover ? cover.src : '';
+    btn.disabled = true;
+    fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{title:title, artist:artist, cover:coverSrc}})}})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(d) {{
+      if (d.status === 'ok' || d.status === 'already_liked') {{
+        var nowLiked = !liked;
+        btn.innerHTML  = nowLiked ? '&#9829;' : '&#9825;';
+        btn.style.color = nowLiked ? '#e05' : '#444';
+        var np = document.getElementById('np-like');
+        var npTitle = document.getElementById('np-title');
+        var npArtist = document.getElementById('np-artist');
+        if (np && npTitle && npTitle.textContent === title && npArtist && npArtist.textContent === artist) {{
+          np.textContent = nowLiked ? '♥' : '♡';
+          np.style.color = nowLiked ? '#e05' : '';
+        }}
+      }}
+      btn.disabled = false;
+    }}).catch(function() {{ btn.disabled = false; }});
+  }};
+}})();
+</script>
 </body>
 </html>"""
 
@@ -1086,6 +1744,235 @@ def html_live() -> str:
   </div>
 {_clock_js(SOURCE_TZ(), SOURCE_TZ(), int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))}
 {_player_js()}
+</body>
+</html>"""
+
+
+def html_playlist(tz: str, iana: str) -> str:
+    s = station()
+    name        = s.get("name", "Radio")
+    name_local  = s.get("name_local", "")
+    accent      = ACCENT()
+    display_name = name_local if name_local else name
+    tabs         = _tz_tabs(tz)
+    tz_upper     = tz.upper()
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{name} — Playlist</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    :root {{ --accent: {accent}; }}
+    body {{
+      background: #0d0d0d; color: #f0f0f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      min-height: 100dvh; display: flex; justify-content: center; padding: 24px 0 40px;
+    }}
+    .card {{
+      background: #181818; border-radius: 20px; padding: 32px 28px;
+      width: min(460px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,.6);
+      align-self: flex-start;
+    }}
+    .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }}
+    .back-btn {{
+      background: #222; border: none; border-radius: 10px; color: #888;
+      font-size: 20px; width: 36px; height: 36px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      text-decoration: none; flex-shrink: 0;
+    }}
+    .back-btn:hover {{ background: #2a2a2a; color: #fff; }}
+    .title {{ font-size: 20px; font-weight: 700; }}
+    .subtitle {{ font-size: 12px; color: #555; margin-top: 2px; }}
+    .date-nav {{
+      display: flex; align-items: center; justify-content: space-between;
+      background: #111; border-radius: 12px; padding: 10px 14px;
+      margin-bottom: 16px;
+    }}
+    .date-nav button {{
+      background: none; border: none; color: #888; font-size: 20px;
+      cursor: pointer; padding: 0 6px; line-height: 1;
+    }}
+    .date-nav button:hover {{ color: #fff; }}
+    .date-nav button:disabled {{ color: #333; cursor: default; }}
+    #date-label {{ font-size: 15px; font-weight: 600; color: #f0f0f0; }}
+    .entries {{ display: flex; flex-direction: column; gap: 2px; min-height: 80px; }}
+    .entry {{
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 4px; border-bottom: 1px solid #1e1e1e; cursor: pointer;
+      border-radius: 8px; transition: background .12s;
+    }}
+    .entry:hover {{ background: #1e1e1e; }}
+    .entry:last-child {{ border-bottom: none; }}
+    .entry-cover {{
+      width: 44px; height: 44px; border-radius: 8px; object-fit: cover;
+      background: #222; flex-shrink: 0;
+    }}
+    .entry-cover-placeholder {{
+      width: 44px; height: 44px; border-radius: 8px;
+      background: #222; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; color: #444;
+    }}
+    .entry-text {{ flex: 1; overflow: hidden; }}
+    .entry-title {{
+      font-size: 14px; font-weight: 600; color: #f0f0f0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }}
+    .entry-artist {{ font-size: 12px; color: #666; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .entry-time {{ font-size: 12px; color: #555; font-variant-numeric: tabular-nums; flex-shrink: 0; }}
+    .entry-like {{ background: none; border: none; color: #444; font-size: 18px; cursor: pointer; padding: 4px 6px; flex-shrink: 0; line-height: 1; border-radius: 6px; }}
+    .entry-like:hover {{ color: #1DB954; background: #1a2a1a; }}
+    .entry-like.liked {{ color: #1DB954; }}
+    .empty-state {{ text-align: center; color: #444; font-size: 14px; padding: 40px 0; }}
+    .spinner {{
+      width: 28px; height: 28px; border: 2px solid #222; border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 1s linear infinite; margin: 40px auto;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+    .tz-tabs {{ display: flex; gap: 8px; margin-top: 20px; }}
+    .tz-tabs a {{
+      flex: 1; text-align: center; padding: 10px 0; border-radius: 10px;
+      background: #222; color: #888; text-decoration: none;
+      font-size: 13px; font-weight: 600; transition: background .15s, color .15s;
+    }}
+    .tz-tabs a.active {{ background: var(--accent); color: #fff; }}
+    .tz-tabs a:hover:not(.active) {{ background: #2a2a2a; color: #ccc; }}
+    .tz-tabs a.live {{ color: #cc2200; }}
+    .tz-tabs a.live.active, .tz-tabs a.live:hover {{ background: #cc2200; color: #fff; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <a class="back-btn" href="/{tz}">&#8592;</a>
+      <div>
+        <div class="title">{display_name} Playlist</div>
+        <div class="subtitle">{tz_upper} · Songs identified by Shazam</div>
+      </div>
+    </div>
+
+    <div class="date-nav">
+      <button id="prev-btn" onclick="changeDay(-1)">&#8249;</button>
+      <span id="date-label">Today</span>
+      <button id="next-btn" onclick="changeDay(1)" disabled>&#8250;</button>
+    </div>
+
+    <div class="entries" id="entries"><div class="spinner"></div></div>
+
+    <div class="tz-tabs">
+      {tabs}
+    </div>
+  </div>
+
+<script>
+(function() {{
+  var tz = '{tz}';
+  var today = new Date();
+  today.setHours(0,0,0,0);
+  var current = new Date(today);
+
+  function fmtDate(d) {{
+    return d.getFullYear() + '-' +
+           String(d.getMonth()+1).padStart(2,'0') + '-' +
+           String(d.getDate()).padStart(2,'0');
+  }}
+
+  function fmtLabel(d) {{
+    var diff = Math.round((today - d) / 86400000);
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Yesterday';
+    return d.toLocaleDateString('en-US', {{ weekday:'long', month:'short', day:'numeric' }});
+  }}
+
+  function load() {{
+    var dateStr = fmtDate(current);
+    document.getElementById('date-label').textContent = fmtLabel(current);
+    document.getElementById('prev-btn').disabled = false;
+    document.getElementById('next-btn').disabled = (current >= today);
+    document.getElementById('entries').innerHTML = '<div class="spinner"></div>';
+
+    fetch('/playlist/' + tz + '/' + dateStr)
+      .then(function(r) {{ return r.json(); }})
+      .then(function(data) {{
+        var entries = data.entries || [];
+        if (entries.length === 0) {{
+          document.getElementById('entries').innerHTML =
+            '<div class="empty-state">No songs logged for this day.</div>';
+          return;
+        }}
+        var html = '';
+        entries.forEach(function(e, idx) {{
+          var searchURL = 'https://music.apple.com/search?term=' +
+            encodeURIComponent((e.title || '') + ' ' + (e.artist || ''));
+          var cover = e.cover
+            ? '<img class="entry-cover" src="' + e.cover + '" alt="" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">' +
+              '<div class="entry-cover-placeholder" style="display:none">&#9835;</div>'
+            : '<div class="entry-cover-placeholder">&#9835;</div>';
+          var safeTitle  = esc(e.title).replace(/'/g, "\\'");
+          var safeArtist = esc(e.artist).replace(/'/g, "\\'");
+          html += '<div class="entry">' +
+            '<div style="display:flex;align-items:center;gap:12px;flex:1;overflow:hidden;cursor:pointer" onclick="window.open(\'' + searchURL + '\',\'_blank\')">' +
+              cover +
+              '<div class="entry-text">' +
+                '<div class="entry-title">' + esc(e.title) + '</div>' +
+                '<div class="entry-artist">' + esc(e.artist) + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="entry-time">' + e.time + '</div>' +
+            '<button class="entry-like" id="like-' + idx + '" onclick="likeSong(this,\'' + safeTitle + '\',\'' + safeArtist + '\')" title="Save to Liked Songs">&#9825;</button>' +
+          '</div>';
+        }});
+        document.getElementById('entries').innerHTML = html;
+      }})
+      .catch(function() {{
+        document.getElementById('entries').innerHTML =
+          '<div class="empty-state">Could not load playlist.</div>';
+      }});
+  }}
+
+  function esc(s) {{
+    return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }}
+
+  window.likeSong = function(btn, title, artist) {{
+    if (window.spotifyLike) window.spotifyLike(title, artist, btn);
+  }};
+
+  window.changeDay = function(delta) {{
+    var next = new Date(current);
+    next.setDate(next.getDate() + delta);
+    if (next > today) return;
+    current = next;
+    load();
+  }};
+
+  // Tab switching keeps audio alive
+  document.querySelectorAll('.tz-tabs a').forEach(function(a) {{
+    a.addEventListener('click', function(e) {{
+      var href = this.getAttribute('href');
+      if (!href.startsWith('/playlist')) {{
+        // navigating back to player — let it go normally
+        return;
+      }}
+    }});
+  }});
+
+  // Rewrite tz-tab links to playlist links
+  document.querySelectorAll('.tz-tabs a').forEach(function(a) {{
+    var href = a.getAttribute('href');
+    var slug = href.replace(/^\\//, '');
+    if (slug !== 'live') {{
+      a.setAttribute('href', '/playlist/' + slug);
+    }}
+  }});
+
+  load();
+}})();
+</script>
+{_spotify_js()}
 </body>
 </html>"""
 
@@ -1203,6 +2090,34 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+        if path == "/like":
+            try:
+                data   = _json.loads(body)
+                status = _liked_songs_add(data.get("title",""), data.get("artist",""), data.get("cover",""))
+                self._serve_json(200, {"status": status})
+            except Exception as e:
+                self._serve_json(500, {"status": "error", "reason": str(e)})
+        elif path == "/unlike":
+            try:
+                data   = _json.loads(body)
+                status = _liked_songs_remove(data.get("title",""), data.get("artist",""))
+                self._serve_json(200, {"status": status})
+            except Exception as e:
+                self._serve_json(500, {"status": "error", "reason": str(e)})
+        elif path == "/spotify/like":
+            try:
+                data   = _json.loads(body)
+                result = _spotify_like(data.get("title", ""), data.get("artist", ""))
+            except Exception as e:
+                result = {"status": "error", "reason": str(e)}
+            self._serve_json(200, result)
+        else:
+            self._text(404, "Not found.\n")
+
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
 
@@ -1213,6 +2128,38 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
                 self._serve_nowplaying(slug, iana)
             else:
                 self._text(404, "Unknown timezone.\n")
+            return
+
+        if path == "/spotify/auth":
+            qs      = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            ret     = qs.get("return", ["/"])[0]
+            auth_url = _spotify_start_auth(ret)
+            self._redirect(auth_url)
+            return
+
+        if path == "/spotify/callback":
+            qs    = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            code  = qs.get("code",  [None])[0]
+            state = qs.get("state", [""])[0]
+            if not code:
+                self._html(400, "<p>Authorization cancelled or failed.</p>")
+                return
+            redirect_to = _spotify_finish_auth(code, state)
+            self._redirect(redirect_to)
+            return
+
+        if path.startswith("/playlist/"):
+            parts = path[len("/playlist/"):].split("/")
+            slug = parts[0]
+            iana = tz_routes().get(slug.upper())
+            if not iana:
+                self._text(404, "Unknown timezone.\n")
+                return
+            date_str = parts[1] if len(parts) > 1 else None
+            if date_str:
+                self._serve_playlist_json(slug, iana, date_str)
+            else:
+                self._serve_playlist_page(slug, iana)
             return
 
         if path.startswith("/stream/"):
@@ -1236,6 +2183,19 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
                 self._serve_stream(slug, iana)
             else:
                 self._text(404, "Unknown stream.\n")
+            return
+
+        if path == "/liked":
+            self._serve_json(200, {"songs": _liked_songs_read()})
+            return
+
+        if path.startswith("/songs/"):
+            slug = path[len("/songs/"):]
+            iana = tz_routes().get(slug.upper())
+            if not iana:
+                self._text(404, "Unknown timezone.\n")
+                return
+            self._serve_songs(slug, iana)
             return
 
         if path == "/live":
@@ -1370,6 +2330,27 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _serve_songs(self, tz: str, iana: str):
+        tz_obj    = ZoneInfo(iana)
+        now_local = datetime.datetime.now(tz_obj)
+        local_date = now_local.date()
+        utc_start  = datetime.datetime.combine(local_date, datetime.time.min, tzinfo=tz_obj).astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        utc_end    = utc_start + datetime.timedelta(days=1)
+        raw        = _load_playlist_entries(utc_start, utc_end)
+        liked_set  = {(s["title"], s["artist"]) for s in _liked_songs_read()}
+        songs = []
+        for e in reversed(raw):
+            udt  = datetime.datetime.strptime(e["utc"], "%Y-%m-%dT%H:%M:%S")
+            ldt  = udt.replace(tzinfo=datetime.timezone.utc).astimezone(tz_obj)
+            songs.append({
+                "title":  e["title"],
+                "artist": e["artist"],
+                "cover":  e.get("cover", ""),
+                "time":   ldt.strftime("%-I:%M %p"),
+                "liked":  (e["title"], e["artist"]) in liked_set,
+            })
+        self._serve_json(200, {"songs": songs, "date": local_date.isoformat()})
+
     def _serve_nowplaying(self, tz: str, iana: str):
         delay = delay_hours_for_tz(iana)
         now = utcnow()
@@ -1381,6 +2362,32 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         seek_sec = int((target_dt - chunk_floor(target_dt)).total_seconds())
         result = recognize_track(target_chunk, seek_sec)
         self._serve_json(200, result)
+
+    def _serve_playlist_json(self, tz: str, iana: str, date_str: str):
+        try:
+            local_date = datetime.date.fromisoformat(date_str)
+        except ValueError:
+            self._text(400, "Invalid date. Use YYYY-MM-DD.\n")
+            return
+        tz_obj = ZoneInfo(iana)
+        local_midnight = datetime.datetime.combine(local_date, datetime.time.min, tzinfo=tz_obj)
+        utc_start = local_midnight.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        utc_end   = utc_start + datetime.timedelta(days=1)
+        raw = _load_playlist_entries(utc_start, utc_end)
+        entries = []
+        for e in raw:
+            utc_dt = datetime.datetime.strptime(e["utc"], "%Y-%m-%dT%H:%M:%S")
+            local_dt = utc_dt.replace(tzinfo=datetime.timezone.utc).astimezone(tz_obj)
+            entries.append({
+                "time":   local_dt.strftime("%H:%M"),
+                "title":  e["title"],
+                "artist": e["artist"],
+                "cover":  e.get("cover", ""),
+            })
+        self._serve_json(200, {"date": date_str, "timezone": tz.upper(), "entries": entries})
+
+    def _serve_playlist_page(self, tz: str, iana: str):
+        self._html(200, html_playlist(tz, iana))
 
     def _serve_json(self, code: int, data: dict):
         b = _json.dumps(data).encode()
@@ -1406,6 +2413,11 @@ class TimeshiftHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
+
+    def _redirect(self, url: str):
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.end_headers()
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -1479,6 +2491,10 @@ def recording_loop():
                             target=detect_and_save_news_skip,
                             args=(out,), daemon=True,
                         ).start()
+                    threading.Thread(
+                        target=scan_chunk_for_playlist,
+                        args=(out,), daemon=True,
+                    ).start()
                     break
                 time.sleep(1)
         finally:
@@ -1522,18 +2538,37 @@ def daemonize():
     PID_FILE().write_text(str(os.getpid()))
 
 
+def _playlist_needs_scan(chunk: Path) -> bool:
+    """Return True if this chunk has no playlist entries logged yet."""
+    chunk_dt = parse_chunk_dt(chunk)
+    if chunk_dt is None:
+        return False
+    iana    = next(iter(tz_routes().values()))
+    delay_h = delay_hours_for_tz(iana)
+    # The playlist entries for this chunk fall on wall_utc = chunk_dt + [0..3600]s + delay_h
+    wall_start = chunk_dt + datetime.timedelta(hours=delay_h)
+    wall_end   = wall_start + datetime.timedelta(hours=1)
+    utc_start  = wall_start
+    utc_end    = wall_end
+    existing   = _load_playlist_entries(utc_start, utc_end)
+    return len(existing) == 0
+
+
 def _scan_missing_mod_files():
     """On startup, kick off detection for completed chunks that have no mod file yet."""
-    if not FILL_TRACK.exists():
-        return
     current = chunk_path(utcnow())
     for chunk in valid_chunks():
         if chunk == current:
             continue  # still recording, skip
-        if not mod_chunk(chunk).exists():
+        if FILL_TRACK.exists() and not mod_chunk(chunk).exists():
             log(f"Startup scan: queuing {chunk.name} for news detection")
             threading.Thread(
                 target=detect_and_save_news_skip, args=(chunk,), daemon=True,
+            ).start()
+        if _playlist_needs_scan(chunk):
+            log(f"Startup scan: queuing {chunk.name} for playlist")
+            threading.Thread(
+                target=scan_chunk_for_playlist, args=(chunk,), daemon=True,
             ).start()
 
 
@@ -1541,6 +2576,7 @@ def daemon_main():
     signal.signal(signal.SIGTERM, _sigterm)
     CACHE_DIR().mkdir(parents=True, exist_ok=True)
     log(f"Daemon started (PID {os.getpid()})")
+    clean_old_playlists()
     threading.Thread(target=run_http_server, daemon=True).start()
     threading.Thread(target=_scan_missing_mod_files, daemon=True).start()
     recording_loop()

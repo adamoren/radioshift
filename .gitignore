@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 # Keep config.toml out of git — use config.example.toml as the template
 config.toml
+spotify_tokens.json
+spotify_playlists.json
+liked_songs.json
