@@ -24,6 +24,8 @@ Records a live radio stream and serves it with a delay so that listeners in diff
 - **Live stream** — `/live` serves the undelayed stream alongside the shifted ones
 - **News skip** — automatically detects and replaces hourly news breaks with ambient fill music
 - **Now playing** — shows the currently playing song title and artist via audio fingerprinting
+- **Mute song** — mutes the current song until the next one is detected (up to 5 minutes)
+- **Liked songs** — save songs with ♡ and browse today's full play history with like toggles
 - **CarPlay / Android Auto** — M3U playlist links work with VLC and other car audio apps
 - **Multiple stations** — run one instance per station, each with its own config file
 - **Auto cleanup** — old chunks are deleted once all timezones have consumed them
